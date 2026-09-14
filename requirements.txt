@@ -1,5 +1,6 @@
-pyrogram>=2.0.106
-tgcrypto>=1.2.5
+pyrogram==2.0.106
+tgcrypto==1.2.5; python_version < "3.12"
+aiohttp>=3.9,<4
 deep-translator>=1.11.4
 python-docx>=1.1.0
 EbookLib>=0.18

@@ -11,6 +11,7 @@ workspace_textbot/
 *.session
 *.session-journal
 *.log
+/tmp/
 
 # OS / editor
 .DS_Store
