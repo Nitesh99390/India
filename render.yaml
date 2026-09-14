@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Render Blueprint — NovelTranslator PRO (free tier, stateless)
+#  Dashboard → New → Blueprint → pick this repo → fill the secret env vars.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  - type: web                      # "web" (not worker) so the free tier applies
+    name: noveltranslator-bot
+    runtime: python
+    plan: free
+    region: singapore              # closest to India; change if you like
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # ── Telegram credentials (https://my.telegram.org & @BotFather) ──
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      # ── Access control ──
+      - key: SECURITY_CODE
+        sync: false
+      - key: OWNER_ID              # your numeric Telegram ID (send /id to the bot)
+        sync: false
+      - key: AUTHORIZED_USERS      # optional: comma-separated IDs kept after restarts
+        value: ""
+      - key: PUBLIC_MODE           # "1" → anyone can use the bot (no code)
+        value: "0"
+      # ── Optional backup forum group (bot must be admin). 0 = disabled ──
+      - key: BACKUP_GROUP_ID
+        value: "0"
+      # ── Tuning ──
+      - key: MAX_INPUT_MB
+        value: "50"
+      - key: MAX_JOBS_PER_USER
+        value: "2"
+      - key: CONCURRENCY
+        value: "8"
+      - key: KEEP_ALIVE            # self-ping so the free instance doesn't sleep
+        value: "1"
+      - key: KEEP_ALIVE_INTERVAL   # seconds (free tier sleeps after 15 min idle)
+        value: "600"
