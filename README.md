@@ -1,14 +1,18 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v3.0 · Stateless edition, built for the Render.com free tier.**
+**v4.0 · MongoDB + Telegram Mini App edition, built for the Render.com free tier.**
 
 A single-file Telegram bot (Pyrogram + aiohttp) that translates whole
 documents (EPUB / TXT / DOCX / PDF) into 25 languages and delivers the result
 as TXT, DOCX or EPUB — split into parts of any size you like.
 
-> 🗄 **No database. No disk persistence.** Everything (users, settings, stats,
-> the bot session itself) lives in RAM and resets on every deploy / restart.
-> Permanent access is configured purely through environment variables.
+> 🗄 **Optional MongoDB persistence.** Set `MONGO_URI` (MongoDB Atlas free tier
+> is enough) and users, settings, stats, security code and job history survive
+> every deploy. Without it the bot falls back to the old fully-in-RAM behaviour.
+>
+> 📱 **Telegram Mini App.** The same process serves a premium dashboard at
+> `/app` — settings, live job progress, history and an owner panel — opened
+> straight from the bot's menu button / bottom keyboard.
 
 ## ✨ Features
 
@@ -25,6 +29,9 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
   (per-chat `BotCommandScope`, so each person sees exactly the commands they can use)
 - **Security-code gate**, owner panel, `/adduser`, `/deluser`, `/broadcast`, `/setcode`, `/id`
 - **Optional backup group** – each job gets its own forum topic with all delivered parts (set `BACKUP_GROUP_ID=0` to disable)
+- **MongoDB persistence (optional)** – write-through RAM cache + background writer (`motor`), so handlers never block on the DB. Collections: `users`, `stats`, `jobs` (90-day TTL history), `chats`, `meta`
+- **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🔒 unlock with security code, 👑 owner panel (users add/remove, broadcast, change code, global stats). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
+- **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
 
 ## 🚀 Deploy on Render (free)
@@ -42,15 +49,19 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
    | `SECURITY_CODE` | any secret ≥ 6 chars users must send to unlock the bot      |
    | `OWNER_ID`      | your numeric Telegram ID (send `/id` to the bot, or @userinfobot) |
 
+   Optional but recommended: `MONGO_URI` → a free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
+   connection string (`mongodb+srv://…`). Allow access from `0.0.0.0/0` in Atlas Network Access.
+
 4. Deploy. Open the service URL → you should see “Telegram bot is online”.
-5. Send `/start` to your bot. 🎉
+5. Send `/start` to your bot. The **📱 App** menu button and the *📱 Mini App* keyboard
+   button open the dashboard (`RENDER_EXTERNAL_URL/app` is wired automatically). 🎉
 
 > ⚠️ Free-tier notes
 > - The instance is spun down after 15 min without HTTP traffic. The built-in
 >   keep-alive pings `RENDER_EXTERNAL_URL/health` every 10 min to prevent that
 >   (`KEEP_ALIVE=0` to disable). Free tier also has a monthly hour budget.
-> - Every deploy/restart wipes memory: users authorised with the code or
->   `/adduser` must re-send the code. Put permanent IDs in `AUTHORIZED_USERS`.
+> - Without `MONGO_URI` every deploy/restart wipes memory: users authorised with the code or
+>   `/adduser` must re-send the code. Put permanent IDs in `AUTHORIZED_USERS` — or just add MongoDB.
 > - Set `OWNER_ID` explicitly; otherwise the first person who sends the code
 >   after each restart becomes the owner.
 
@@ -63,6 +74,12 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 | `OWNER_ID`           | `0`     | Permanent owner. `0` → first unlocked user becomes owner       |
 | `AUTHORIZED_USERS`   | —       | Comma-separated IDs pre-authorised on every start             |
 | `PUBLIC_MODE`        | `0`     | `1` → anyone can use the bot, no code needed                  |
+| `MONGO_URI`          | —       | MongoDB connection string. Empty → in-memory only              |
+| `MONGO_DB`           | `noveltranslator` | Database name                                        |
+| `HISTORY_LIMIT`      | `30`    | Jobs kept per user in history (5–100)                          |
+| `PUBLIC_URL`         | `RENDER_EXTERNAL_URL` | Public HTTPS base URL (needed for the Mini App)  |
+| `MINI_APP_URL`       | `PUBLIC_URL/app` | Override the Mini App URL                               |
+| `MINIAPP_DEV_USER`   | `0`     | Local dev only: fake Telegram user id for `http://localhost/app` |
 | `BACKUP_GROUP_ID`    | `0`     | Forum-enabled supergroup where the bot is admin. `0` = off    |
 | `MAX_INPUT_MB`       | `50`    | Max upload size                                               |
 | `MAX_JOBS_PER_USER`  | `2`     | Running + queued jobs allowed per user                        |
@@ -83,6 +100,10 @@ cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, SECURITY_CODE, 
 python bot.py             # http://localhost:10000/health
 ```
 
+Test the Mini App UI without Telegram: set `MINIAPP_DEV_USER=<your id>` and open
+`http://localhost:10000/app` — the API treats you as that user (only works when
+`RENDER_EXTERNAL_URL` is unset, i.e. never in production).
+
 ### Docker
 
 ```bash
@@ -92,11 +113,31 @@ docker run -d --env-file .env -p 10000:10000 noveltranslator
 
 ## 💬 Commands
 
-**Users**: `/start` `/settings` `/queue` `/cancel` `/mystats` `/id` `/help`
+**Users**: `/start` `/app` `/settings` `/queue` `/cancel` `/mystats` `/id` `/help`
 **Owner**: `/stats` `/users` `/adduser <id>` `/deluser <id>` `/broadcast <text>` `/setcode <code>` `/links`
+
+## 📱 Mini App API (served by `bot.py`)
+
+All endpoints expect `Authorization: tma <initData>` (Telegram WebApp `initData`, HMAC-verified).
+
+| Method | Path                    | Purpose                                   |
+|--------|-------------------------|-------------------------------------------|
+| GET    | `/api/me`               | Profile, prefs, stats + public config      |
+| POST   | `/api/unlock`           | `{code}` → unlock a locked user            |
+| POST   | `/api/settings`         | `{lang?, fmt?, split?}`                    |
+| GET    | `/api/jobs`             | Active / queue / pending uploads / history |
+| POST   | `/api/jobs/start`       | `{job_id, lang, fmt, split}` finish wizard |
+| POST   | `/api/jobs/cancel`      | `{job_id?}` cancel own (owner: any) jobs   |
+| GET    | `/api/admin/overview`   | Owner: users, global stats, recent jobs    |
+| POST   | `/api/admin/users`      | Owner: `{action: add\|remove, id}`        |
+| POST   | `/api/admin/broadcast`  | Owner: `{text}`                            |
+| POST   | `/api/admin/setcode`    | Owner: `{code}`                            |
+
+Static files live in `miniapp/` (`index.html`, `style.css`, `app.js` — no build step).
 
 ## 🔒 Security
 
 - No credentials are hard-coded; the bot refuses to start if required env vars are missing.
 - The security-code message is deleted from the chat after a successful unlock.
+- Mini App requests are authenticated with Telegram's `initData` HMAC (bot-token derived key, 24 h max age); the dev-user bypass is disabled whenever `RENDER_EXTERNAL_URL` is set.
 - `.env`, sessions and temp folders are git-ignored. Rotate your bot token if it was ever shared publicly.

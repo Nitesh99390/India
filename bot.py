@@ -3,18 +3,21 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║        📚 NovelTranslator PRO  —  Telegram Document Translation Bot       ║
-║          v3.0  ·  Stateless edition for Render.com free tier              ║
+║          v4.0  ·  MongoDB + Mini App edition for Render.com               ║
 ╠══════════════════════════════════════════════════════════════════════════╣
-║  • No database / no disk persistence  → everything lives in memory       ║
+║  • MongoDB persistence (motor)        → users / settings / stats / jobs  ║
+║    survive restarts. Falls back to RAM when MONGO_URI is not set.        ║
+║  • Telegram Mini App (/app)           → premium dashboard: settings,     ║
+║    live job progress, history, owner panel — served by the same process  ║
+║  • Hierarchical reply keyboard        → tap a menu → sub-menu appears    ║
 ║  • Bot session kept in memory         → no .session files                ║
-║  • Tiny HTTP health server on $PORT   → required by Render web services  ║
-║  • Optional self keep-alive ping      → prevents free-tier spin-down     ║
-║  • Graceful SIGTERM handling          → users are told when a deploy     ║
-║    interrupts their job                                                  ║
+║  • Health server on $PORT + keep-alive ping + graceful SIGTERM handling  ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -26,8 +29,10 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl
 
 import aiohttp
 import docx
@@ -51,7 +56,14 @@ from pyrogram.raw import functions  # noqa: E402
 from pyrogram.types import (BotCommand, BotCommandScopeAllPrivateChats,  # noqa: E402
                             BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
                             ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
-                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
+                            KeyboardButton, MenuButtonWebApp, Message, ReplyKeyboardMarkup,
+                            ReplyKeyboardRemove, WebAppInfo)
+
+try:  # optional: MongoDB persistence
+    from motor.motor_asyncio import AsyncIOMotorClient
+    HAS_MOTOR = True
+except ImportError:  # pragma: no cover
+    HAS_MOTOR = False
 
 try:
     from pypdf import PdfReader
@@ -131,6 +143,19 @@ RENDER_EXTERNAL_URL = _env("RENDER_EXTERNAL_URL").rstrip("/")
 KEEP_ALIVE = _env_bool("KEEP_ALIVE", True)
 KEEP_ALIVE_INTERVAL = max(60, _env_int("KEEP_ALIVE_INTERVAL", 600))
 
+# MongoDB (optional — without it everything lives in RAM as before)
+MONGO_URI = _env("MONGO_URI") or _env("MONGODB_URI") or _env("DATABASE_URL")
+MONGO_DB = _env("MONGO_DB", "noveltranslator")
+HISTORY_LIMIT = max(5, min(_env_int("HISTORY_LIMIT", 30), 100))
+
+# Telegram Mini App — served by this very process at /app (needs a public HTTPS URL)
+PUBLIC_URL = (_env("PUBLIC_URL") or RENDER_EXTERNAL_URL).rstrip("/")
+MINI_APP_URL = _env("MINI_APP_URL") or (f"{PUBLIC_URL}/app" if PUBLIC_URL else "")
+MINI_APP_DIR = _env("MINI_APP_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp")
+MINIAPP_DEV_USER = _env_int("MINIAPP_DEV_USER", 0)   # local testing only: fake signed-in user id
+INIT_DATA_MAX_AGE = 24 * 3600
+BOOT_TS = int(time.time())
+
 # Temp workspace — ephemeral by design (Render disks are wiped on every deploy)
 BASE_DIR = _env("WORK_DIR") or os.path.join(tempfile.gettempdir(), "noveltranslator")
 STORAGE_DIR = os.path.join(BASE_DIR, "out")
@@ -196,14 +221,19 @@ validate_config()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🧠 IN-MEMORY STORE  (intentionally non-persistent — resets on every deploy)
+# 🧠 STORE  —  write-through in-memory cache backed by MongoDB (optional)
 # ═══════════════════════════════════════════════════════════════════════════
-class MemoryStore:
-    """All state lives here. Nothing is written to disk or to a database.
+class Store:
+    """All state is kept in RAM for fast synchronous access; every mutation is
+    additionally persisted to MongoDB (when MONGO_URI is configured) through a
+    background writer queue, so handlers never block on the database.
+
+    Collections: users · stats (single doc) · jobs (history) · chats · meta
 
     Bootstrapping on every start:
       • OWNER_ID           → owner (if set)
       • AUTHORIZED_USERS   → pre-authorised users
+      • MongoDB            → previously saved users / stats / history (if any)
       • SECURITY_CODE      → anyone who sends it gets access (first one may
                              become owner if OWNER_ID is not set)
     """
@@ -214,16 +244,132 @@ class MemoryStore:
         self.users: Dict[int, dict] = {}
         self.chats: Dict[int, dict] = {}
         self.stats = {"jobs": 0, "parts": 0, "chars": 0, "failed": 0, "cancelled": 0}
+        self.history: Dict[int, Deque[dict]] = {}          # uid → recent jobs (newest first)
         self.booted = time.time()
+        self.db = None                                      # motor database (or None)
+        self.connected = False
+        self._writes: Optional[asyncio.Queue] = None
+        self._writer_task: Optional[asyncio.Task] = None
         if OWNER_ID:
             self.authorize(OWNER_ID, "Owner")
         for uid in AUTHORIZED_USERS:
             self.authorize(uid, "Pre-authorized")
 
+    # ── MongoDB lifecycle ──────────────────────────────────────────────
+    async def connect(self) -> bool:
+        if not MONGO_URI:
+            log.info("MONGO_URI not set → running with in-memory storage only")
+            return False
+        if not HAS_MOTOR:
+            log.error("MONGO_URI is set but 'motor' is not installed → in-memory storage only")
+            return False
+        try:
+            client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000, appname="noveltranslator")
+            await client.admin.command("ping")
+            self.db = client[MONGO_DB]
+            await asyncio.gather(
+                self.db.jobs.create_index([("uid", 1), ("ts", -1)]),
+                self.db.jobs.create_index("ts", expireAfterSeconds=90 * 24 * 3600),
+                return_exceptions=True)
+            await self._load()
+            self._writes = asyncio.Queue()
+            self._writer_task = asyncio.create_task(self._writer(), name="mongo_writer")
+            self.connected = True
+            log.info("MongoDB connected (db=%s, users=%d)", MONGO_DB, len(self.users))
+            return True
+        except Exception as e:
+            log.error("MongoDB connection failed (%s) → falling back to in-memory storage", e)
+            self.db = None
+            return False
+
+    async def _load(self) -> None:
+        """Merge persisted state into the RAM cache. Env-configured users win."""
+        async for doc in self.db.users.find({}):
+            try:
+                uid = int(doc["_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            doc.pop("_id", None)
+            existing = self.users.get(uid)
+            merged = {**self._default_user(doc.get("name", "User")), **doc}
+            merged["stats"] = {**{"jobs": 0, "parts": 0, "chars": 0}, **(doc.get("stats") or {})}
+            if existing:
+                merged["role"] = existing["role"]
+            self.users[uid] = merged
+        if uid_ := self.owner_id:
+            if uid_ in self.users:
+                self.users[uid_]["role"] = "owner"
+        s = await self.db.stats.find_one({"_id": "global"})
+        if s:
+            for k in self.stats:
+                self.stats[k] = int(s.get(k, 0) or 0)
+        meta = await self.db.meta.find_one({"_id": "meta"})
+        if meta:
+            if not self.owner_id and meta.get("owner_id"):
+                self.owner_id = int(meta["owner_id"])
+                if self.owner_id in self.users:
+                    self.users[self.owner_id]["role"] = "owner"
+            if not SECURITY_CODE and meta.get("security_code"):
+                self.security_code = meta["security_code"]
+        async for doc in self.db.chats.find({}):
+            try:
+                self.chats[int(doc["_id"])] = {"title": doc.get("title", "Chat"), "type": doc.get("type", "group"),
+                                               "added": doc.get("added", 0)}
+            except (KeyError, TypeError, ValueError):
+                pass
+        cursor = self.db.jobs.find({}, {"_id": 0}).sort("ts", -1).limit(HISTORY_LIMIT * 20)
+        async for doc in cursor:
+            dq = self.history.setdefault(int(doc.get("uid", 0)), deque(maxlen=HISTORY_LIMIT))
+            if len(dq) < HISTORY_LIMIT:
+                dq.append(doc)
+
+    async def _writer(self) -> None:
+        while True:
+            op = await self._writes.get()
+            try:
+                await op()
+            except Exception as e:
+                log.warning("mongo write failed: %s", e)
+            finally:
+                self._writes.task_done()
+
+    async def flush(self, timeout: float = 5.0) -> None:
+        if self._writes:
+            try:
+                await asyncio.wait_for(self._writes.join(), timeout)
+            except asyncio.TimeoutError:
+                pass
+        if self._writer_task:
+            self._writer_task.cancel()
+
+    def _enqueue(self, coro_factory) -> None:
+        if self.db is not None and self._writes is not None:
+            self._writes.put_nowait(coro_factory)
+
+    # ── persistence helpers (fire-and-forget) ──────────────────────────
+    def _save_user(self, uid: int) -> None:
+        u = self.users.get(uid)
+        if u is None:
+            return
+        snapshot = json.loads(json.dumps(u))
+        self._enqueue(lambda: self.db.users.replace_one({"_id": uid}, snapshot, upsert=True))
+
+    def _delete_user(self, uid: int) -> None:
+        self._enqueue(lambda: self.db.users.delete_one({"_id": uid}))
+
+    def _save_stats(self) -> None:
+        snapshot = dict(self.stats)
+        self._enqueue(lambda: self.db.stats.replace_one({"_id": "global"}, snapshot, upsert=True))
+
+    def _save_meta(self) -> None:
+        snapshot = {"owner_id": self.owner_id, "security_code": self.security_code, "updated": int(time.time())}
+        self._enqueue(lambda: self.db.meta.update_one({"_id": "meta"}, {"$set": snapshot}, upsert=True))
+
     @staticmethod
     def _default_user(name: str) -> dict:
         return {"name": name, "joined": int(time.time()), "role": "user",
                 "lang": DEFAULT_LANG, "fmt": DEFAULT_FORMAT, "split": DEFAULT_SPLIT_KB,
+                "last_seen": int(time.time()),
                 "stats": {"jobs": 0, "parts": 0, "chars": 0}}
 
     # ── users ──────────────────────────────────────────────────────────
@@ -231,16 +377,28 @@ class MemoryStore:
         return self.users.get(uid)
 
     def ensure_user(self, uid: int, name: str) -> dict:
-        """Used in PUBLIC_MODE: silently create a profile on first contact."""
+        """Create a profile on first contact (PUBLIC_MODE) / refresh the name."""
         u = self.users.get(uid)
+        changed = False
         if u is None:
             u = self._default_user(name or "User")
             self.users[uid] = u
-        elif name:
+            changed = True
+        elif name and u.get("name") != name:
             u["name"] = name
-        if uid == self.owner_id:
+            changed = True
+        if uid == self.owner_id and u.get("role") != "owner":
             u["role"] = "owner"
+            changed = True
+        if changed:
+            self._save_user(uid)
         return u
+
+    def touch(self, uid: int) -> None:
+        u = self.users.get(uid)
+        if u and time.time() - u.get("last_seen", 0) > 600:
+            u["last_seen"] = int(time.time())
+            self._save_user(uid)
 
     def is_authorized(self, uid: int) -> bool:
         return PUBLIC_MODE or uid in self.users
@@ -249,18 +407,25 @@ class MemoryStore:
         u = self.ensure_user(uid, name)
         if not self.owner_id:
             self.owner_id = uid
-        if uid == self.owner_id:
+            self._save_meta()
+        if uid == self.owner_id and u.get("role") != "owner":
             u["role"] = "owner"
+        self._save_user(uid)
         return u
 
     def revoke(self, uid: int) -> bool:
         if uid in self.users and uid != self.owner_id:
             del self.users[uid]
+            self._delete_user(uid)
             return True
         return False
 
     def is_owner(self, uid: int) -> bool:
         return bool(self.owner_id) and uid == self.owner_id
+
+    def set_security_code(self, code_: str) -> None:
+        self.security_code = code_
+        self._save_meta()
 
     # ── prefs & stats ──────────────────────────────────────────────────
     def pref(self, uid: int, key: str, default=None):
@@ -273,6 +438,7 @@ class MemoryStore:
             u = self.ensure_user(uid, "User")
         if u is not None:
             u[key] = value
+            self._save_user(uid)
 
     def bump(self, uid: int, parts: int, chars: int, failed=False, cancelled=False):
         u = self.users.get(uid)
@@ -280,6 +446,7 @@ class MemoryStore:
             u["stats"]["jobs"] += 1
             u["stats"]["parts"] += parts
             u["stats"]["chars"] += chars
+            self._save_user(uid)
         if failed:
             self.stats["failed"] += 1
         elif cancelled:
@@ -288,16 +455,37 @@ class MemoryStore:
             self.stats["jobs"] += 1
             self.stats["parts"] += parts
             self.stats["chars"] += chars
+        self._save_stats()
+
+    # ── job history ────────────────────────────────────────────────────
+    def add_history(self, uid: int, entry: dict) -> None:
+        entry = {"uid": uid, "ts": int(time.time()), **entry}
+        dq = self.history.setdefault(uid, deque(maxlen=HISTORY_LIMIT))
+        dq.appendleft(entry)
+        snapshot = dict(entry)
+        self._enqueue(lambda: self.db.jobs.insert_one(dict(snapshot)))
+
+    def user_history(self, uid: int, limit: int = 20) -> List[dict]:
+        return list(self.history.get(uid, ()))[:limit]
+
+    def recent_history(self, limit: int = 20) -> List[dict]:
+        allj = [j for dq in self.history.values() for j in dq]
+        allj.sort(key=lambda j: j.get("ts", 0), reverse=True)
+        return allj[:limit]
 
     # ── chats ──────────────────────────────────────────────────────────
     def track_chat(self, chat_id: int, title: str, ctype: str):
-        self.chats[chat_id] = {"title": title, "type": ctype, "added": int(time.time())}
+        doc = {"title": title, "type": ctype, "added": int(time.time())}
+        self.chats[chat_id] = doc
+        self._enqueue(lambda: self.db.chats.replace_one({"_id": chat_id}, doc, upsert=True))
 
     def untrack_chat(self, chat_id: int):
         self.chats.pop(chat_id, None)
+        self._enqueue(lambda: self.db.chats.delete_one({"_id": chat_id}))
 
 
-store = MemoryStore()
+MemoryStore = Store          # backwards-compatible alias
+store = Store()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -354,8 +542,16 @@ def split_label(kb: int) -> str:
 def kb_rows(buttons: List[InlineKeyboardButton], per_row: int = 2) -> List[List[InlineKeyboardButton]]:
     return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
 
+def app_inline_button() -> Optional[InlineKeyboardButton]:
+    if MINI_APP_URL.startswith("https://"):
+        return InlineKeyboardButton("📱 Open Mini App", web_app=WebAppInfo(url=MINI_APP_URL))
+    return None
+
 def home_keyboard(uid: int) -> InlineKeyboardMarkup:
-    rows = [
+    rows = []
+    if (btn := app_inline_button()):
+        rows.append([btn])
+    rows += [
         [InlineKeyboardButton("⚙️ Settings", callback_data="nav:settings"),
          InlineKeyboardButton("📊 My Stats", callback_data="nav:mystats")],
         [InlineKeyboardButton("📋 Queue", callback_data="nav:queue"),
@@ -369,53 +565,109 @@ def back_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav:home")]])
 
 
-# ── Reply keyboard (persistent bottom menu) — role based ───────────────────
-# Every button label maps to the command it triggers. Users see only the
-# user buttons; the owner additionally gets the admin row(s).
+# ── Reply keyboard (persistent bottom menu) — hierarchical & role based ────
+# The bottom keyboard is organised as small *pages* instead of one big grid:
+#
+#   MAIN      →  📱 Mini App | 🛠 Tools | ⚙️ Settings | 👑 Admin (owner) | ℹ️ Help
+#   TOOLS     →  📋 Queue | 📊 My Stats | 🛑 Cancel Job | 🆔 My ID | ◀️ Back
+#   SETTINGS  →  🌐 Language | 📄 Format | ✂️ Split | 📱 Mini App | ◀️ Back
+#   ADMIN     →  👑 Owner Panel | 👥 Users | 📣 Broadcast | 🔗 Links | ◀️ Back
+#
+# Tapping a menu button *replaces* the keyboard with that sub-page, so only
+# 3–5 buttons are ever visible at once. Every leaf maps to a command.
 BTN_HOME      = "🏠 Home"
+BTN_APP       = "📱 Mini App"
+BTN_TOOLS     = "🛠 Tools"
 BTN_SETTINGS  = "⚙️ Settings"
+BTN_ADMIN     = "👑 Admin"
+BTN_HELP      = "ℹ️ Help"
+BTN_BACK      = "◀️ Back"
+
 BTN_QUEUE     = "📋 Queue"
 BTN_MYSTATS   = "📊 My Stats"
 BTN_CANCEL    = "🛑 Cancel Job"
-BTN_HELP      = "ℹ️ Help"
 BTN_MYID      = "🆔 My ID"
+
+BTN_LANG      = "🌐 Language"
+BTN_FORMAT    = "📄 Format"
+BTN_SPLIT     = "✂️ Split size"
+
 BTN_OWNER     = "👑 Owner Panel"
 BTN_USERS     = "👥 Users"
 BTN_BROADCAST = "📣 Broadcast"
 BTN_LINKS     = "🔗 Links"
 
+# Leaf buttons → command they trigger
 USER_BUTTONS: Dict[str, str] = {
-    BTN_HOME: "start", BTN_SETTINGS: "settings", BTN_QUEUE: "queue",
-    BTN_MYSTATS: "mystats", BTN_CANCEL: "cancel", BTN_HELP: "help", BTN_MYID: "id",
+    BTN_HOME: "start", BTN_HELP: "help", BTN_QUEUE: "queue", BTN_MYSTATS: "mystats",
+    BTN_CANCEL: "cancel", BTN_MYID: "id", BTN_SETTINGS: "settings",
+    BTN_LANG: "setlang", BTN_FORMAT: "setformat", BTN_SPLIT: "setsplit", BTN_APP: "app",
 }
 OWNER_BUTTONS: Dict[str, str] = {
     BTN_OWNER: "stats", BTN_USERS: "users", BTN_BROADCAST: "broadcast", BTN_LINKS: "links",
 }
 ALL_BUTTONS: Dict[str, str] = {**USER_BUTTONS, **OWNER_BUTTONS}
+# Buttons that only switch the keyboard page (no command)
+MENU_BUTTONS = {BTN_TOOLS: "tools", BTN_ADMIN: "admin", BTN_BACK: "main"}
+KB_PAGE: Dict[int, str] = {}      # chat_id → current keyboard page (RAM only)
 
-def reply_keyboard(uid: int) -> ReplyKeyboardMarkup:
-    """Bottom keyboard. Owner gets extra admin rows; normal users only the basics."""
-    rows = [
-        [KeyboardButton(BTN_HOME), KeyboardButton(BTN_SETTINGS), KeyboardButton(BTN_HELP)],
-        [KeyboardButton(BTN_QUEUE), KeyboardButton(BTN_MYSTATS), KeyboardButton(BTN_CANCEL)],
-    ]
-    if store.is_owner(uid):
-        rows.append([KeyboardButton(BTN_OWNER), KeyboardButton(BTN_USERS)])
-        rows.append([KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_LINKS)])
+def _app_button() -> KeyboardButton:
+    if MINI_APP_URL.startswith("https://"):
+        return KeyboardButton(BTN_APP, web_app=WebAppInfo(url=MINI_APP_URL))
+    return KeyboardButton(BTN_APP)
+
+def reply_keyboard(uid: int, page: str = "main") -> ReplyKeyboardMarkup:
+    """Bottom keyboard for the given page. Owner gets the extra Admin page."""
+    owner = store.is_owner(uid)
+    if page == "tools":
+        rows = [[KeyboardButton(BTN_QUEUE), KeyboardButton(BTN_MYSTATS)],
+                [KeyboardButton(BTN_CANCEL), KeyboardButton(BTN_MYID)],
+                [KeyboardButton(BTN_BACK)]]
+        ph = "🛠 Tools — pick an action…"
+    elif page == "settings":
+        rows = [[KeyboardButton(BTN_LANG), KeyboardButton(BTN_FORMAT)],
+                [KeyboardButton(BTN_SPLIT), _app_button()],
+                [KeyboardButton(BTN_BACK)]]
+        ph = "⚙️ Settings — what to change?"
+    elif page == "admin" and owner:
+        rows = [[KeyboardButton(BTN_OWNER), KeyboardButton(BTN_USERS)],
+                [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_LINKS)],
+                [KeyboardButton(BTN_BACK)]]
+        ph = "👑 Admin — owner tools…"
     else:
-        rows.append([KeyboardButton(BTN_MYID)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
-                               placeholder="📎 Send a document or pick an option…")
+        page = "main"
+        rows = [[_app_button()],
+                [KeyboardButton(BTN_TOOLS), KeyboardButton(BTN_SETTINGS)],
+                [KeyboardButton(BTN_ADMIN), KeyboardButton(BTN_HELP)] if owner else [KeyboardButton(BTN_HELP)]]
+        ph = "📎 Send a document or open a menu…"
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, placeholder=ph)
 
 def locked_keyboard() -> ReplyKeyboardMarkup:
     """Minimal keyboard for people who are not unlocked yet."""
     return ReplyKeyboardMarkup([[KeyboardButton(BTN_MYID)]], resize_keyboard=True, is_persistent=True,
                                placeholder="🔒 Send the security code…")
 
+PAGE_TITLES = {
+    "main": ("Main Menu", "🏠", "Choose a section below.\n📱 Mini App opens the full dashboard."),
+    "tools": ("Tools", "🛠", "Queue · stats · cancel · your ID"),
+    "settings": ("Settings", "⚙️", "Change your defaults for ⚡ Quick Start."),
+    "admin": ("Admin", "👑", "Owner tools — users, broadcast, links."),
+}
+
+async def show_page(m: Message, page: str, note: str = "") -> None:
+    """Swap the bottom keyboard to another page (short confirmation message)."""
+    uid = m.from_user.id
+    if page == "admin" and not store.is_owner(uid):
+        page = "main"
+    KB_PAGE[m.chat.id] = page
+    title, icon, hint = PAGE_TITLES[page]
+    await m.reply(f"{icon} {b(title)}\n<i>{esc(note or hint)}</i>", reply_markup=reply_keyboard(uid, page))
+
 
 # ── Bot command menu (the “/” list) — role based via BotCommandScope ───────
 USER_COMMANDS = [
-    BotCommand("start",    "🏠 Home screen"),
+    BotCommand("start",    "🏠 Home screen & menu"),
+    BotCommand("app",      "📱 Open the Mini App dashboard"),
     BotCommand("settings", "⚙️ Default language, format, split size"),
     BotCommand("queue",    "📋 Current queue status"),
     BotCommand("cancel",   "🛑 Cancel your active / queued jobs"),
@@ -491,6 +743,7 @@ def text_home(uid: int, name: str) -> str:
         f"✂️ Split: {b(split_label(split))}\n"
         f"{DIV}\n"
         f"<i>Tip: change defaults in ⚙️ Settings\nand use ⚡ Quick Start next time.</i>"
+        + ("\n<i>📱 Tap <b>Mini App</b> for the full dashboard.</i>" if MINI_APP_URL.startswith("https://") else "")
     )
 
 def text_help() -> str:
@@ -502,6 +755,7 @@ def text_help() -> str:
         "4️⃣ Receive translated parts\n\n"
         f"{b('Commands')}\n"
         "/start – Home screen\n"
+        "/app – Open the Mini App dashboard\n"
         "/settings – Default language, format, split\n"
         "/queue – Current queue status\n"
         "/cancel – Cancel your active job\n"
@@ -509,15 +763,17 @@ def text_help() -> str:
         "/help – This message\n"
         "/id – Your Telegram ID\n\n"
         f"{b('Menu')}\n"
-        "<i>Use the ⌨️ buttons at the bottom of the chat —\n"
-        "they trigger the same commands with one tap.</i>\n\n"
+        "<i>Use the ⌨️ buttons at the bottom of the chat.\n"
+        "🛠 Tools / ⚙️ Settings open a sub-menu;\n"
+        "◀️ Back returns to the main menu.</i>\n\n"
         f"{b('Split size')}\n"
         "Large books are delivered in parts.\n"
         f"Custom size: {MIN_SPLIT_KB} KB – {MAX_SPLIT_KB // 1024} MB\n"
         "e.g. <code>750</code>, <code>2 MB</code>, <code>900kb</code>\n\n"
-        f"{b('Note')}\n"
-        "<i>This bot keeps no database. Settings and\n"
-        "statistics reset whenever the server restarts.</i>"
+        f"{b('Storage')}\n"
+        + ("<i>Settings, statistics and job history are saved in MongoDB.</i>"
+           if store.connected else
+           "<i>No database connected — settings and statistics\nreset whenever the server restarts.</i>")
     )
 
 def text_settings(uid: int) -> str:
@@ -528,17 +784,20 @@ def text_settings(uid: int) -> str:
         f"📄 Format: {b(fmt.upper())}\n"
         f"✂️ Split size: {b(split_label(split))}\n"
         f"{DIV}\n"
-        "<i>These are used by ⚡ Quick Start\nand pre-selected in the wizard.\n"
-        "Settings are kept in memory only.</i>"
+        "<i>These are used by ⚡ Quick Start\nand pre-selected in the wizard.</i>"
+        + ("" if store.connected else "\n<i>⚠️ No database — settings reset on restart.</i>")
     )
 
 def settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🌐 Language", callback_data="st:lang"),
          InlineKeyboardButton("📄 Format", callback_data="st:fmt")],
         [InlineKeyboardButton("✂️ Split size", callback_data="st:spl")],
-        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
-    ])
+    ]
+    if (btn := app_inline_button()):
+        rows.append([btn])
+    rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
 
 def language_keyboard(prefix: str, selected: str, back_cb: str) -> InlineKeyboardMarkup:
     btns = [InlineKeyboardButton(f"{'✅ ' if c == selected else ''}{flag} {name}", callback_data=f"{prefix}{c}")
@@ -898,6 +1157,7 @@ class Job:
     created: float = field(default_factory=time.time)
     msg: Optional[Message] = None
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    progress: dict = field(default_factory=dict)      # live info for the Mini App
 
     @property
     def lang_name(self) -> str:
@@ -1202,6 +1462,9 @@ async def process_job(job: Job):
         if len(text) < 20:
             job.status = "failed"
             store.bump(job.user_id, 0, 0, failed=True)
+            store.add_history(job.user_id, {"job_id": job.job_id, "name": job.novel_name, "lang": job.lang,
+                                            "fmt": job.out_format, "size": job.file_size, "status": "failed",
+                                            "error": "NoText", "user": job.user_name})
             await live.update(header("Failed", "❌") + summary_block(job) + f"{DIV}\n"
                               "No readable text found.\n<i>Scanned PDFs / image-only files are not supported.</i>",
                               back_home_kb(), force=True)
@@ -1222,11 +1485,13 @@ async def process_job(job: Job):
                             f"🧩 Parts: {b(total_parts)}  ·  🔤 Chars: {b(fmt_int(total_chars))}",
                             **backup_kwargs)
 
+        job.progress.update({"parts": total_parts, "chars": total_chars, "phase": "translating"})
         for i, part_text in enumerate(parts, 1):
             if job.cancel.is_set():
                 raise JobCancelled()
             chunks = build_chunks(part_text)
             eng = TranslationEngine(job.lang)
+            job.progress.update({"part": i, "engine": eng})
 
             async def on_progress(e: TranslationEngine, _i=i):
                 if job.cancel.is_set():
@@ -1262,6 +1527,10 @@ async def process_job(job: Job):
         job.status = "done"
         store.bump(job.user_id, total_parts, total_chars)
         elapsed = time.time() - started
+        store.add_history(job.user_id, {"job_id": job.job_id, "name": job.novel_name, "lang": job.lang,
+                                        "fmt": job.out_format, "split": job.split_kb, "size": job.file_size,
+                                        "parts": total_parts, "chars": total_chars, "secs": int(elapsed),
+                                        "status": "done", "user": job.user_name})
         await live.update(
             header("Completed", "✅") + summary_block(job) + f"{DIV}\n"
             f"🧩 Parts: {b(total_parts)}\n"
@@ -1274,6 +1543,9 @@ async def process_job(job: Job):
     except JobCancelled:
         job.status = "cancelled"
         store.bump(job.user_id, 0, 0, cancelled=True)
+        store.add_history(job.user_id, {"job_id": job.job_id, "name": job.novel_name, "lang": job.lang,
+                                        "fmt": job.out_format, "size": job.file_size, "status": "cancelled",
+                                        "secs": int(time.time() - started), "user": job.user_name})
         reason = "Server is restarting (new deploy). Please resend the file in a minute." if SHUTTING_DOWN \
             else "Job stopped by user."
         await live.update(header("Cancelled", "🛑") + summary_block(job) + f"{DIV}\n{reason}", back_home_kb(), force=True)
@@ -1285,6 +1557,10 @@ async def process_job(job: Job):
         job.status = "failed"
         log.exception("Job %s failed: %s", job.job_id, e)
         store.bump(job.user_id, 0, 0, failed=True)
+        store.add_history(job.user_id, {"job_id": job.job_id, "name": job.novel_name, "lang": job.lang,
+                                        "fmt": job.out_format, "size": job.file_size, "status": "failed",
+                                        "error": type(e).__name__, "secs": int(time.time() - started),
+                                        "user": job.user_name})
         await live.update(header("Error", "⚠️") + summary_block(job) + f"{DIV}\n"
                           f"Something went wrong: {code(type(e).__name__)}\nPlease try again.",
                           back_home_kb(), force=True)
@@ -1367,13 +1643,15 @@ async def cmd_start(_, m: Message):
     USER_STATE.pop(m.chat.id, None)
     uid = m.from_user.id
     await set_user_commands(uid)
-    # 1) persistent bottom reply keyboard (role based)  2) inline home menu
-    await m.reply(header("Menu", "⌨️") +
-                  ("👑 Owner menu enabled — admin buttons added below."
-                   if store.is_owner(uid) else "Use the buttons below for quick access."),
-                  reply_markup=reply_keyboard(uid))
+    store.touch(uid)
+    # 1) persistent bottom reply keyboard (main page, role based)  2) inline home menu
+    KB_PAGE[m.chat.id] = "main"
     await m.reply(text_home(uid, m.from_user.first_name or "there"),
-                  reply_markup=home_keyboard(uid))
+                  reply_markup=reply_keyboard(uid, "main"))
+    await m.reply("⌨️ " + b("Menu ready") + "\n<i>" +
+                  ("👑 Owner mode — the Admin page is enabled."
+                   if store.is_owner(uid) else "Use the buttons below — each menu opens a sub-menu.") +
+                  "</i>", reply_markup=home_keyboard(uid))
 
 @app.on_message(filters.command("help") & PRIVATE & authorized)
 async def cmd_help(_, m: Message):
@@ -1383,6 +1661,36 @@ async def cmd_help(_, m: Message):
 async def cmd_settings(_, m: Message):
     touch_user(m)
     await m.reply(text_settings(m.from_user.id), reply_markup=settings_keyboard())
+
+@app.on_message(filters.command(["setlang", "setformat", "setsplit"]) & PRIVATE & authorized)
+async def cmd_set_pref(_, m: Message):
+    """Direct jump into one settings sub-page (used by the ⚙️ Settings keyboard page)."""
+    touch_user(m)
+    uid = m.from_user.id
+    lang, fmt, split = user_prefs(uid)
+    what = m.command[0].lower()
+    if what == "setlang":
+        await m.reply(header("Default language", "🌐") + f"Current: {b(lang_label(lang))}\nPick a new default:",
+                      reply_markup=language_keyboard("sl:", lang, "nav:settings"))
+    elif what == "setformat":
+        await m.reply(header("Default format", "📄") + f"Current: {b(fmt.upper())}\nPick a new default:",
+                      reply_markup=format_keyboard("sf:", fmt, "nav:settings"))
+    else:
+        await m.reply(header("Default split size", "✂️") + f"Current: {b(split_label(split))}\nPick a new default:",
+                      reply_markup=split_keyboard("ss:", split, "nav:settings", None))
+
+@app.on_message(filters.command("app") & PRIVATE & authorized)
+async def cmd_app(_, m: Message):
+    touch_user(m)
+    if not MINI_APP_URL.startswith("https://"):
+        return await m.reply(header("Mini App", "📱") +
+                             "The Mini App is not configured yet.\n"
+                             "<i>Set <code>PUBLIC_URL</code> (or <code>RENDER_EXTERNAL_URL</code>) to a public "
+                             "HTTPS address and redeploy.</i>")
+    await m.reply(header("Mini App", "📱") +
+                  "Your dashboard: settings, live progress,\nhistory and stats — all in one place.\n\n"
+                  "<i>Tap the button below to open it.</i>",
+                  reply_markup=InlineKeyboardMarkup([[app_inline_button()]]))
 
 def text_queue(uid: int) -> str:
     lines = [header("Queue Status", "📋")]
@@ -1437,7 +1745,7 @@ def text_mystats(uid: int) -> str:
         f"📚 Files translated: {b(s.get('jobs', 0))}\n"
         f"🧩 Parts delivered: {b(s.get('parts', 0))}\n"
         f"🔤 Characters: {b(fmt_int(s.get('chars', 0)))}\n"
-        f"{DIV}\n<i>Stats are in-memory and reset on redeploy.</i>"
+        + ("" if store.connected else f"{DIV}\n<i>Stats are in-memory and reset on redeploy.</i>")
     )
 
 @app.on_message(filters.command("mystats") & PRIVATE & authorized)
@@ -1471,8 +1779,11 @@ def text_owner() -> str:
         "/setcode &lt;new code&gt;\n"
         "/links – admin invite links\n"
         "/stats – this panel\n"
-        f"{DIV}\n<i>⚠️ No database: users added at runtime are lost on\n"
-        "restart. Put permanent IDs in AUTHORIZED_USERS env.</i>"
+        f"{DIV}\n"
+        + (f"<i>🗄 MongoDB connected ({esc(MONGO_DB)}) — users, settings\nand history are persistent.</i>"
+           if store.connected else
+           "<i>⚠️ No database: users added at runtime are lost on\n"
+           "restart. Put permanent IDs in AUTHORIZED_USERS env.</i>")
     )
 
 @app.on_message(filters.command("stats") & PRIVATE & owner_only)
@@ -1499,8 +1810,8 @@ async def cmd_adduser(_, m: Message):
     uid = int(m.command[1])
     store.authorize(uid, "Added by owner")
     await set_user_commands(uid, force=True)
-    await m.reply(f"✅ User {code(uid)} authorized.\n"
-                  f"<i>Add to AUTHORIZED_USERS env to keep after restarts.</i>")
+    await m.reply(f"✅ User {code(uid)} authorized." +
+                  ("" if store.connected else "\n<i>Add to AUTHORIZED_USERS env to keep after restarts.</i>"))
     await safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.",
                     reply_markup=reply_keyboard(uid))
 
@@ -1523,13 +1834,14 @@ async def cmd_setcode(_, m: Message):
     new_code = m.text.split(None, 1)[1].strip()
     if len(new_code) < 6:
         return await m.reply("⚠️ Code must be at least 6 characters.")
-    store.security_code = new_code
+    store.set_security_code(new_code)
     try:
         await m.delete()
     except Exception:
         pass
-    await m.reply("🔐 Security code updated (until next restart).\n"
-                  "<i>Set SECURITY_CODE env to make it permanent.</i>")
+    await m.reply("🔐 Security code updated.\n" +
+                  ("<i>Saved to MongoDB — it survives restarts unless SECURITY_CODE env overrides it.</i>"
+                   if store.connected else "<i>Set SECURITY_CODE env to make it permanent.</i>"))
 
 @app.on_message(filters.command("broadcast") & PRIVATE & owner_only)
 async def cmd_broadcast(_, m: Message):
@@ -1602,6 +1914,9 @@ def wizard_lang_text(job: Job) -> str:
 def wizard_lang_kb(job: Job) -> InlineKeyboardMarkup:
     kb = language_keyboard(f"jl:{job.job_id}:", job.lang, f"jx:{job.job_id}")
     rows = [[InlineKeyboardButton("⚡ Quick Start (use my defaults)", callback_data=f"jq:{job.job_id}")]]
+    if MINI_APP_URL.startswith("https://"):
+        rows.append([InlineKeyboardButton("📱 Configure in Mini App",
+                                          web_app=WebAppInfo(url=f"{MINI_APP_URL}#job={job.job_id}"))])
     rows += kb.inline_keyboard[:-1]
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"jx:{job.job_id}")])
     return InlineKeyboardMarkup(rows)
@@ -1865,16 +2180,29 @@ async def handle_text(client: Client, m: Message):
     chat_id = m.chat.id
     text_lower = m.text.strip().lower()
 
-    # ── Reply-keyboard buttons → dispatch to the matching command ──────────
-    btn_cmd = ALL_BUTTONS.get(m.text.strip())
+    label = m.text.strip()
+
+    # ── Menu buttons → switch the bottom keyboard page ─────────────────────
+    if label in MENU_BUTTONS:
+        USER_STATE.pop(chat_id, None)
+        return await show_page(m, MENU_BUTTONS[label])
+    if label == BTN_SETTINGS:
+        # opens the settings sub-page *and* shows the inline settings card
+        KB_PAGE[chat_id] = "settings"
+        touch_user(m)
+        return await m.reply(text_settings(m.from_user.id), reply_markup=reply_keyboard(m.from_user.id, "settings"))
+
+    # ── Leaf buttons → dispatch to the matching command ────────────────────
+    btn_cmd = ALL_BUTTONS.get(label)
     if btn_cmd:
         if btn_cmd in OWNER_BUTTONS.values() and not store.is_owner(m.from_user.id):
             # user somehow pressed an owner button (stale keyboard) → refresh their keyboard
-            return await m.reply("🔒 Owner only.", reply_markup=reply_keyboard(m.from_user.id))
+            return await show_page(m, "main", "🔒 Owner only — menu refreshed.")
         m.command = [btn_cmd]            # so handlers see it as a real command
         handler = {
             "start": cmd_start, "settings": cmd_settings, "queue": cmd_queue,
             "mystats": cmd_mystats, "cancel": cmd_cancel, "help": cmd_help, "id": cmd_id,
+            "setlang": cmd_set_pref, "setformat": cmd_set_pref, "setsplit": cmd_set_pref, "app": cmd_app,
             "stats": cmd_stats, "users": cmd_users, "broadcast": cmd_broadcast, "links": cmd_links,
         }[btn_cmd]
         return await handler(client, m)
@@ -1903,15 +2231,366 @@ async def handle_text(client: Client, m: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🌍 HEALTH SERVER  (Render web services must bind $PORT)
+# 📱 MINI APP  —  Telegram Web App served from /app  +  JSON API under /api
 # ═══════════════════════════════════════════════════════════════════════════
 BOT_USERNAME = ""
 
+def verify_init_data(init_data: str) -> Optional[dict]:
+    """Validate Telegram WebApp initData (HMAC-SHA256) → parsed dict or None."""
+    if not init_data:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        their_hash = pairs.pop("hash", "")
+        if not their_hash:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, their_hash):
+            return None
+        auth_date = int(pairs.get("auth_date", "0") or 0)
+        if auth_date and time.time() - auth_date > INIT_DATA_MAX_AGE:
+            return None
+        if "user" in pairs:
+            pairs["user"] = json.loads(pairs["user"])
+        return pairs
+    except Exception as e:
+        log.debug("initData verification failed: %s", e)
+        return None
+
+def _api_user(request: web.Request) -> Optional[dict]:
+    """Resolve the Telegram user behind an API call (header: Authorization: tma <initData>)."""
+    auth = request.headers.get("Authorization", "")
+    init_data = auth[4:].strip() if auth.lower().startswith("tma ") else ""
+    data = verify_init_data(init_data)
+    if data and isinstance(data.get("user"), dict) and data["user"].get("id"):
+        u = data["user"]
+        return {"id": int(u["id"]), "name": (u.get("first_name") or "User").strip(),
+                "username": u.get("username") or "", "photo": u.get("photo_url") or "",
+                "lang_code": u.get("language_code") or ""}
+    if MINIAPP_DEV_USER and not init_data and not RENDER_EXTERNAL_URL:
+        return {"id": MINIAPP_DEV_USER, "name": "Dev User", "username": "dev", "photo": "", "lang_code": "en"}
+    return None
+
+def _json(data: Any, status: int = 200) -> web.Response:
+    return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
+
+def _err(msg: str, status: int = 400, **extra) -> web.Response:
+    return _json({"ok": False, "error": msg, **extra}, status)
+
+def _job_public(j: Job, uid: int, position: int = 0) -> dict:
+    eng = j.progress.get("engine")
+    done = eng.done if eng else 0
+    total = eng.total if eng else 0
+    part = j.progress.get("part", 0)
+    parts = j.progress.get("parts", 0)
+    ratio = 0.0
+    if j.status == "running" and parts:
+        ratio = ((part - 1) + (done / total if total else 0)) / parts
+    return {
+        "job_id": j.job_id, "name": j.novel_name, "size": j.file_size, "ext": j.ext,
+        "lang": j.lang, "fmt": j.out_format, "split": j.split_kb, "status": j.status,
+        "mine": j.user_id == uid, "user": j.user_name if store.is_owner(uid) or j.user_id == uid else "",
+        "position": position, "created": int(j.created),
+        "progress": {"ratio": round(ratio, 4), "part": part, "parts": parts,
+                     "chunks_done": done, "chunks_total": total,
+                     "speed": round(eng.speed, 2) if eng else 0, "eta": int(eng.eta) if eng else 0,
+                     "elapsed": int(time.time() - eng.started) if eng else 0,
+                     "phase": j.progress.get("phase", "")},
+    }
+
+def _config_public() -> dict:
+    return {
+        "bot": BOT_NAME, "username": BOT_USERNAME, "public_mode": PUBLIC_MODE,
+        "db": store.connected, "db_name": MONGO_DB if store.connected else "",
+        "languages": [{"code": c, "name": n, "flag": f} for c, (n, f) in LANGUAGES.items()],
+        "formats": [{"code": c, "label": lbl} for c, lbl in OUTPUT_FORMATS.items()],
+        "split_presets": [{"kb": kb, "label": lbl} for kb, lbl in SPLIT_PRESETS],
+        "split_range": [MIN_SPLIT_KB, MAX_SPLIT_KB], "max_input_mb": MAX_INPUT_MB,
+        "max_jobs": MAX_JOBS_PER_USER, "input_exts": sorted(INPUT_EXTS),
+        "version": "4.0",
+    }
+
+def _me_payload(tg: dict) -> dict:
+    uid = tg["id"]
+    u = store.user(uid) or {}
+    lang, fmt, split = user_prefs(uid)
+    return {
+        "id": uid, "name": u.get("name") or tg["name"], "username": tg.get("username", ""),
+        "photo": tg.get("photo", ""), "role": "owner" if store.is_owner(uid) else u.get("role", "user"),
+        "owner": store.is_owner(uid), "joined": u.get("joined", 0),
+        "prefs": {"lang": lang, "fmt": fmt, "split": split},
+        "stats": {**{"jobs": 0, "parts": 0, "chars": 0}, **(u.get("stats") or {})},
+        "active_jobs": user_job_count(uid),
+    }
+
+def _require(request: web.Request) -> Tuple[Optional[dict], Optional[web.Response]]:
+    tg = _api_user(request)
+    if not tg:
+        return None, _err("Unauthorized — open this page from Telegram.", 401, code="auth")
+    if PUBLIC_MODE:
+        store.ensure_user(tg["id"], tg["name"])
+    if not store.is_authorized(tg["id"]):
+        return tg, _err("This bot is private. Enter the security code.", 403, code="locked", id=tg["id"])
+    store.ensure_user(tg["id"], tg["name"])
+    store.touch(tg["id"])
+    return tg, None
+
+async def api_me(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
+
+async def api_unlock(request: web.Request) -> web.Response:
+    tg = _api_user(request)
+    if not tg:
+        return _err("Unauthorized", 401, code="auth")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code_ = str(body.get("code", "")).strip()
+    if store.is_authorized(tg["id"]):
+        return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
+    if not code_ or not store.security_code or not hmac.compare_digest(code_, store.security_code):
+        await asyncio.sleep(1.0)          # slow down brute force
+        return _err("Wrong security code.", 403, code="locked", id=tg["id"])
+    store.authorize(tg["id"], tg["name"])
+    asyncio.create_task(set_user_commands(tg["id"], force=True))
+    asyncio.create_task(safe_send(tg["id"], header("Access Granted", "✅") +
+                                  f"Welcome, {b(tg['name'])}! Unlocked via Mini App.\nSend /start to see the menu.",
+                                  reply_markup=reply_keyboard(tg["id"])))
+    return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
+
+async def api_settings(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _err("Invalid JSON")
+    uid = tg["id"]
+    changed = []
+    if "lang" in body:
+        if body["lang"] not in LANGUAGES:
+            return _err("Unknown language")
+        store.set_pref(uid, "lang", body["lang"]); changed.append("lang")
+    if "fmt" in body:
+        if body["fmt"] not in OUTPUT_FORMATS:
+            return _err("Unknown format")
+        store.set_pref(uid, "fmt", body["fmt"]); changed.append("fmt")
+    if "split" in body:
+        try:
+            val = int(body["split"])
+        except (TypeError, ValueError):
+            return _err("Split must be a number (KB)")
+        if val != 0 and not MIN_SPLIT_KB <= val <= MAX_SPLIT_KB:
+            return _err(f"Split must be 0 or between {MIN_SPLIT_KB} KB and {MAX_SPLIT_KB // 1024} MB")
+        store.set_pref(uid, "split", val); changed.append("split")
+    return _json({"ok": True, "changed": changed, "me": _me_payload(tg)})
+
+async def api_jobs(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    uid = tg["id"]
+    owner = store.is_owner(uid)
+    active = _job_public(ACTIVE, uid) if ACTIVE else None
+    queue = [_job_public(j, uid, i) for i, j in enumerate(QUEUE, 1)]
+    pending = [_job_public(j, uid) for j in PENDING.values() if j.user_id == uid]
+    history = store.user_history(uid, 25)
+    return _json({"ok": True, "active": active, "queue": queue, "pending": pending, "history": history,
+                  "queue_len": len(QUEUE), "global": store.stats if owner else None,
+                  "server_time": int(time.time()), "shutting_down": SHUTTING_DOWN})
+
+async def api_job_start(request: web.Request) -> web.Response:
+    """Finish the wizard from the Mini App: pick options for a pending upload and enqueue it."""
+    tg, err = _require(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _err("Invalid JSON")
+    uid = tg["id"]
+    job = PENDING.get(str(body.get("job_id", "")))
+    if not job or job.user_id != uid:
+        return _err("Upload not found or expired — send the file again.", 404)
+    if SHUTTING_DOWN:
+        return _err("Server is restarting, try again shortly.", 503)
+    if user_job_count(uid) >= MAX_JOBS_PER_USER:
+        return _err(f"Max {MAX_JOBS_PER_USER} jobs at once. Wait or cancel one.", 429)
+    lang = body.get("lang", job.lang); fmt = body.get("fmt", job.out_format)
+    try:
+        split = int(body.get("split", job.split_kb))
+    except (TypeError, ValueError):
+        return _err("Split must be a number (KB)")
+    if lang not in LANGUAGES or fmt not in OUTPUT_FORMATS:
+        return _err("Unknown language or format")
+    if split != 0 and not MIN_SPLIT_KB <= split <= MAX_SPLIT_KB:
+        return _err("Split size out of range")
+    job.lang, job.out_format, job.split_kb = lang, fmt, split
+    PENDING.pop(job.job_id, None)
+    USER_STATE.pop(job.chat_id, None)
+    if job.msg is not None:
+        await enqueue(job, job.msg)
+    else:
+        msg = await safe_send(job.chat_id, header("Queued", "⏳") + summary_block(job))
+        await enqueue(job, msg)
+    return _json({"ok": True, "job": _job_public(job, uid, queue_position(job))})
+
+async def api_job_cancel(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    uid = tg["id"]
+    target = str(body.get("job_id", "") or "")
+    owner = store.is_owner(uid)
+    n = 0
+    if ACTIVE and (not target or ACTIVE.job_id == target) and (ACTIVE.user_id == uid or owner):
+        ACTIVE.cancel.set(); n += 1
+    for j in [j for j in QUEUE if (not target or j.job_id == target) and (j.user_id == uid or owner)]:
+        QUEUE.remove(j); j.status = "cancelled"; j.cleanup(); n += 1
+        await LiveMessage(j.msg).update(header("Cancelled", "🛑") + summary_block(j), back_home_kb(), force=True)
+    for jid, j in [(k, v) for k, v in PENDING.items() if (not target or k == target) and v.user_id == uid]:
+        PENDING.pop(jid, None); j.cleanup(); USER_STATE.pop(j.chat_id, None); n += 1
+        await LiveMessage(j.msg).update(header("Cancelled", "❌") + f"📘 {b(j.novel_name)} was discarded.",
+                                        back_home_kb(), force=True)
+    if n:
+        asyncio.create_task(notify_positions())
+    return _json({"ok": True, "cancelled": n})
+
+async def api_admin_overview(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    if not store.is_owner(tg["id"]):
+        return _err("Owner only", 403)
+    users = []
+    for uid, u in sorted(store.users.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True):
+        users.append({"id": uid, "name": u.get("name", "User"), "role": u.get("role", "user"),
+                      "joined": u.get("joined", 0), "last_seen": u.get("last_seen", 0),
+                      "stats": u.get("stats", {}), "lang": u.get("lang", DEFAULT_LANG)})
+    return _json({"ok": True, "stats": store.stats, "uptime": int(time.time() - store.booted),
+                  "users": users, "chats": len(store.chats), "recent": store.recent_history(30),
+                  "active": _job_public(ACTIVE, tg["id"]) if ACTIVE else None,
+                  "queue_len": len(QUEUE), "pending_len": len(PENDING),
+                  "db": store.connected, "public_mode": PUBLIC_MODE,
+                  "backup_group": BACKUP_GROUP_ID, "security_code_set": bool(store.security_code)})
+
+async def api_admin_users(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    if not store.is_owner(tg["id"]):
+        return _err("Owner only", 403)
+    try:
+        body = await request.json()
+        action = body.get("action"); uid = int(body.get("id"))
+    except Exception:
+        return _err("Expected {action: add|remove, id: <int>}")
+    if action == "add":
+        store.authorize(uid, str(body.get("name") or "Added via Mini App")[:64])
+        asyncio.create_task(set_user_commands(uid, force=True))
+        asyncio.create_task(safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.",
+                                      reply_markup=reply_keyboard(uid)))
+        return _json({"ok": True})
+    if action == "remove":
+        if not store.revoke(uid):
+            return _err("Not found (or is the owner)", 404)
+        asyncio.create_task(clear_user_commands(uid))
+        asyncio.create_task(safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed.",
+                                      reply_markup=ReplyKeyboardRemove()))
+        return _json({"ok": True})
+    return _err("Unknown action")
+
+async def api_admin_broadcast(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    if not store.is_owner(tg["id"]):
+        return _err("Owner only", 403)
+    try:
+        body = await request.json()
+        text = str(body.get("text", "")).strip()
+    except Exception:
+        text = ""
+    if not text or len(text) > 3500:
+        return _err("Text required (max 3500 chars)")
+
+    async def _run():
+        sent = failed = 0
+        for uid in list(store.users.keys()):
+            try:
+                await app.send_message(uid, header("Announcement", "📣") + esc(text))
+                sent += 1
+            except FloodWait as e:
+                await asyncio.sleep(min(float(e.value) + 1, 60))
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.1)
+        await safe_send(tg["id"], f"📣 Broadcast done.\n✅ Sent: {b(sent)}  ·  ❌ Failed: {b(failed)}")
+
+    asyncio.create_task(_run())
+    return _json({"ok": True, "recipients": len(store.users)})
+
+async def api_admin_setcode(request: web.Request) -> web.Response:
+    tg, err = _require(request)
+    if err:
+        return err
+    if not store.is_owner(tg["id"]):
+        return _err("Owner only", 403)
+    try:
+        body = await request.json()
+        new_code = str(body.get("code", "")).strip()
+    except Exception:
+        new_code = ""
+    if len(new_code) < 6:
+        return _err("Code must be at least 6 characters")
+    store.set_security_code(new_code)
+    return _json({"ok": True, "persistent": store.connected})
+
+# ── static Mini App files ──────────────────────────────────────────────────
+_STATIC_TYPES = {".html": "text/html", ".css": "text/css", ".js": "application/javascript",
+                 ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
+                 ".json": "application/json", ".webmanifest": "application/manifest+json"}
+
+async def miniapp_file(request: web.Request) -> web.Response:
+    rel = request.match_info.get("path", "") or "index.html"
+    rel = os.path.normpath(rel).lstrip(os.sep).replace("\\", "/")
+    if rel.startswith("..") or "/.." in rel:
+        raise web.HTTPNotFound()
+    path = os.path.join(MINI_APP_DIR, rel)
+    if not os.path.isfile(path):
+        if os.path.isfile(os.path.join(MINI_APP_DIR, "index.html")):
+            path = os.path.join(MINI_APP_DIR, "index.html")
+        else:
+            raise web.HTTPNotFound()
+    ext = os.path.splitext(path)[1].lower()
+    ctype = _STATIC_TYPES.get(ext, "application/octet-stream")
+    headers = {"Cache-Control": "no-cache"} if ext == ".html" else {"Cache-Control": "public, max-age=300"}
+    return web.FileResponse(path, headers={**headers, "Content-Type": f"{ctype}; charset=utf-8"
+                                           if ctype.startswith("text/") or "javascript" in ctype or "json" in ctype else ctype})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🌍 HEALTH SERVER  (Render web services must bind $PORT)
+# ═══════════════════════════════════════════════════════════════════════════
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok" if not SHUTTING_DOWN else "shutting_down",
         "bot": BOT_USERNAME,
+        "version": "4.0",
         "uptime_sec": int(time.time() - store.booted),
+        "db": "mongodb" if store.connected else "memory",
+        "mini_app": bool(MINI_APP_URL),
         "users": len(store.users),
         "active": ACTIVE.novel_name if ACTIVE else None,
         "queue": len(QUEUE),
@@ -1921,22 +2600,39 @@ async def health(_request: web.Request) -> web.Response:
 
 async def index(_request: web.Request) -> web.Response:
     body = (f"<!doctype html><meta charset='utf-8'><title>{html.escape(BOT_NAME)}</title>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<body style='font-family:system-ui;padding:2rem;background:#0f172a;color:#e2e8f0'>"
             f"<h1>📚 {html.escape(BOT_NAME)}</h1>"
             f"<p>Telegram bot is <b style='color:#4ade80'>online</b>"
             + (f" as <a style='color:#93c5fd' href='https://t.me/{html.escape(BOT_USERNAME)}'>@{html.escape(BOT_USERNAME)}</a>" if BOT_USERNAME else "")
-            + ".</p><p><a style='color:#93c5fd' href='/health'>/health</a></p></body>")
+            + f".</p><p>Storage: <b>{'MongoDB' if store.connected else 'in-memory'}</b></p>"
+            f"<p><a style='color:#93c5fd' href='/health'>/health</a> · "
+            f"<a style='color:#93c5fd' href='/app'>/app</a> (Mini App — open from Telegram)</p></body>")
     return web.Response(text=body, content_type="text/html")
 
 async def start_health_server() -> web.AppRunner:
-    web_app = web.Application()
-    web_app.add_routes([web.get("/", index), web.get("/health", health), web.head("/", index),
-                        web.head("/health", health)])
+    web_app = web.Application(client_max_size=256 * 1024)
+    web_app.add_routes([
+        web.get("/", index),                      # aiohttp registers HEAD automatically
+        web.get("/health", health),
+        # Mini App
+        web.get("/app", miniapp_file), web.get("/app/", miniapp_file), web.get("/app/{path:.*}", miniapp_file),
+        web.get("/api/me", api_me),
+        web.post("/api/unlock", api_unlock),
+        web.post("/api/settings", api_settings),
+        web.get("/api/jobs", api_jobs),
+        web.post("/api/jobs/start", api_job_start),
+        web.post("/api/jobs/cancel", api_job_cancel),
+        web.get("/api/admin/overview", api_admin_overview),
+        web.post("/api/admin/users", api_admin_users),
+        web.post("/api/admin/broadcast", api_admin_broadcast),
+        web.post("/api/admin/setcode", api_admin_setcode),
+    ])
     runner = web.AppRunner(web_app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Health server listening on 0.0.0.0:%d", PORT)
+    log.info("HTTP server listening on 0.0.0.0:%d (mini app dir: %s)", PORT, MINI_APP_DIR)
     return runner
 
 async def keep_alive():
@@ -1983,6 +2679,7 @@ async def main():
     global QUEUE_WAKE, BOT_USERNAME
     QUEUE_WAKE = asyncio.Event()
     runner = await start_health_server()          # bind the port FIRST → Render sees us healthy
+    await store.connect()                         # MongoDB (optional) → loads users / stats / history
 
     for attempt in range(1, 6):
         try:
@@ -2006,19 +2703,27 @@ async def main():
     BOT_USERNAME = me.username or ""
     # Command menu: default scope = locked/user list; owner + pre-authorised users get their own list
     await set_global_commands()
-    for uid in list(store.users.keys()):
+    for uid in list(store.users.keys())[:200]:
         await set_user_commands(uid, force=True)
+    # Chat "menu" button (next to the attach icon) opens the Mini App
+    if MINI_APP_URL.startswith("https://"):
+        try:
+            await app.set_chat_menu_button(menu_button=MenuButtonWebApp("📱 App", WebAppInfo(url=MINI_APP_URL)))
+        except Exception as e:
+            log.debug("set_chat_menu_button: %s", e)
     tasks = [asyncio.create_task(queue_worker(), name="queue_worker"),
              asyncio.create_task(janitor(), name="janitor"),
              asyncio.create_task(keep_alive(), name="keep_alive")]
-    log.info("%s online as @%s | owner=%s | preauth=%d | public=%s | pdf=%s | port=%d",
-             BOT_NAME, me.username, store.owner_id or "none", len(AUTHORIZED_USERS), PUBLIC_MODE, HAS_PDF, PORT)
+    log.info("%s online as @%s | owner=%s | users=%d | public=%s | pdf=%s | db=%s | app=%s | port=%d",
+             BOT_NAME, me.username, store.owner_id or "none", len(store.users), PUBLIC_MODE, HAS_PDF,
+             "mongodb" if store.connected else "memory", MINI_APP_URL or "-", PORT)
     if store.owner_id:
         await safe_send(store.owner_id, header("Bot Online", "🟢") +
-                        f"@{me.username} is running on Render.\n"
-                        f"👥 Pre-authorized: {b(len(store.users))}\n"
+                        f"@{me.username} is running.\n"
+                        f"👥 Users: {b(len(store.users))}\n"
                         f"📄 PDF support: {b('yes' if HAS_PDF else 'no')}\n"
-                        f"🗄 Storage: {b('in-memory (no database)')}")
+                        f"🗄 Storage: {b('MongoDB · ' + MONGO_DB if store.connected else 'in-memory (no database)')}\n"
+                        f"📱 Mini App: {b('enabled' if MINI_APP_URL.startswith('https://') else 'not configured')}")
     else:
         log.warning("No owner yet — first user to send the security code becomes owner.")
 
@@ -2029,6 +2734,7 @@ async def main():
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await store.flush()
     if HTTP and not HTTP.closed:
         await HTTP.close()
     try:
