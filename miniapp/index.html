@@ -12,8 +12,12 @@
     // Debug hook: after load, log which view is visible (helps headless checks)
     window.addEventListener("load", () => setTimeout(() => {
       const v = [...document.querySelectorAll(".view")].find(x => !x.classList.contains("hidden"));
-      console.log("[miniapp] view=" + (v ? v.id : "none"));
-    }, 1500));
+      const t = (id) => { const el = document.getElementById(id); return el && !el.closest(".hidden") ? el.textContent.trim() : ""; };
+      const vis = (id) => { const el = document.getElementById(id); return !!el && !el.classList.contains("hidden"); };
+      console.log("[miniapp] view=" + (v ? v.id : "none")
+        + (v && v.id === "view-locked" ? ` title="${t("locked-title")}" status="${t("locked-status")}" request=${vis("request-form")} pending=${vis("pending-actions")}` : "")
+        + (v && v.id === "view-main" ? ` name="${t("me-name")}" role="${t("me-role")}" access="${t("access-chip")}" admin=${vis("nav-admin")} owner=${!document.querySelector(".owner-only.hidden")}` : ""));
+    }, 2500));
   </script>
 </head>
 <body>
@@ -25,16 +29,26 @@
       <p class="muted">Connecting…</p>
     </section>
 
-    <!-- ── Locked (security code) ───────────────────────────────────── -->
+    <!-- ── Locked (approval based) ──────────────────────────────────── -->
     <section id="view-locked" class="view center hidden">
-      <div class="logo">🔒</div>
-      <h1>Private Bot</h1>
-      <p class="muted">Enter the security code to unlock.</p>
-      <form id="unlock-form" class="unlock">
-        <input id="unlock-code" type="password" placeholder="Security code" autocomplete="off" required>
-        <button type="submit" class="btn primary">Unlock</button>
+      <div class="logo" id="locked-icon">🔒</div>
+      <h1 id="locked-title">Private Bot</h1>
+      <p class="muted" id="locked-text">Access is granted by the owner. Send a request and you will be notified in the chat.</p>
+      <div id="locked-card" class="card access-card hidden">
+        <div class="access-row"><span class="muted">Status</span><b id="locked-status">—</b></div>
+        <div class="access-row hidden" id="locked-row-req"><span class="muted">Requested</span><b id="locked-requested">—</b></div>
+        <div class="access-row hidden" id="locked-row-reason"><span class="muted">Reason</span><b id="locked-reason">—</b></div>
+        <div class="access-row hidden" id="locked-row-exp"><span class="muted">Expired</span><b id="locked-expired">—</b></div>
+      </div>
+      <form id="request-form" class="unlock hidden">
+        <input id="request-note" type="text" maxlength="200" placeholder="Optional note for the owner…" autocomplete="off">
+        <button type="submit" class="btn primary">🙋 Request Access</button>
       </form>
-      <p id="unlock-error" class="error hidden"></p>
+      <div id="pending-actions" class="unlock hidden">
+        <button id="btn-recheck" class="btn">🔄 Check status</button>
+        <button id="btn-withdraw" class="btn danger">↩️ Withdraw request</button>
+      </div>
+      <p id="locked-error" class="error hidden"></p>
       <p class="tiny muted">Your ID: <code id="locked-id">—</code></p>
     </section>
 
@@ -68,6 +82,8 @@
         <div id="tab-home" class="tab">
           <div id="alert-shutdown" class="banner warn hidden">⚠️ Server is restarting — jobs will resume when you resend the file.</div>
 
+          <div id="access-banner" class="banner warn hidden"></div>
+
           <div id="pending-card" class="card accent hidden">
             <div class="card-title">📎 Finish your upload</div>
             <div id="pending-list"></div>
@@ -87,6 +103,11 @@
             <div class="stat"><div class="stat-v" id="s-jobs">0</div><div class="stat-l">Jobs</div></div>
             <div class="stat"><div class="stat-v" id="s-parts">0</div><div class="stat-l">Parts</div></div>
             <div class="stat"><div class="stat-v" id="s-chars">0</div><div class="stat-l">Chars</div></div>
+          </div>
+
+          <div class="card" id="access-card">
+            <div class="card-title">🎫 My access <span id="access-chip" class="chip"></span></div>
+            <div id="access-body" class="small"></div>
           </div>
 
           <div class="card howto">
@@ -149,31 +170,42 @@
             <p class="muted small" id="db-note">Only metadata is stored (users · settings · counters · job history). Files never touch the database.</p>
           </div>
 
+          <div class="card accent" id="pending-req-card">
+            <div class="card-title">⏳ Access requests <span id="a-pending" class="chip">0</span></div>
+            <div id="admin-pending"><p class="muted small">No pending requests. 🎉</p></div>
+          </div>
+
           <div class="card">
-            <div class="card-title">👥 Users</div>
+            <div class="card-title">👥 Users <span id="a-counts" class="chip"></span></div>
+            <div class="filters" id="user-filters">
+              <button class="choice on" data-f="all">All</button>
+              <button class="choice" data-f="approved">✅ Approved</button>
+              <button class="choice" data-f="expired">⌛ Expired</button>
+              <button class="choice" data-f="none">🔒 No access</button>
+              <button class="choice" data-f="rejected">❌ Rejected</button>
+              <button class="choice" data-f="banned">🚫 Banned</button>
+              <button class="choice" data-f="admin">🛡 Admins</button>
+            </div>
             <form id="adduser-form" class="inline-input">
               <input id="adduser-id" type="number" placeholder="Telegram ID" required>
-              <button type="submit" class="btn small primary">Add</button>
+              <select id="adduser-plan"></select>
+              <button type="submit" class="btn small primary">Approve</button>
             </form>
             <div id="admin-users"></div>
           </div>
 
-          <div class="card">
+          <div class="card owner-only">
             <div class="card-title">📣 Broadcast</div>
-            <textarea id="bc-text" rows="3" maxlength="3500" placeholder="Message for all users…"></textarea>
-            <button id="bc-send" class="btn primary full">Send to everyone</button>
+            <textarea id="bc-text" rows="3" maxlength="3500" placeholder="Message for all approved users…"></textarea>
+            <button id="bc-send" class="btn primary full">Send to approved users</button>
           </div>
 
-          <div class="card">
-            <div class="card-title">🔐 Security code</div>
-            <form id="setcode-form" class="inline-input">
-              <input id="setcode-val" type="text" minlength="6" placeholder="New code (min 6 chars)" required>
-              <button type="submit" class="btn small">Save</button>
-            </form>
-            <p class="tiny muted" id="setcode-note"></p>
+          <div class="card owner-only">
+            <div class="card-title">📜 Audit log</div>
+            <div id="admin-audit"><p class="muted small">Nothing yet.</p></div>
           </div>
 
-          <div class="card">
+          <div class="card owner-only">
             <div class="card-title">🕘 Recent (all users)</div>
             <div id="admin-recent"></div>
           </div>
@@ -188,6 +220,24 @@
         <button data-tab="admin" class="nav hidden" id="nav-admin"><span>👑</span>Admin</button>
       </nav>
     </section>
+
+    <!-- User management sheet (admin) -->
+    <div id="usheet" class="sheet hidden">
+      <div class="sheet-body">
+        <div class="sheet-head">
+          <b id="usheet-title">👤 User</b>
+          <button id="usheet-close" class="x">✕</button>
+        </div>
+        <div id="usheet-body"></div>
+        <div id="usheet-plans" class="choices row"></div>
+        <div class="inline-input" id="usheet-custom-row">
+          <input id="usheet-duration" type="text" placeholder="Custom: 45d · 3m · 2y · forever · 2026-12-31">
+          <button id="usheet-approve-custom" class="btn small primary">✅ Apply</button>
+        </div>
+        <input id="usheet-reason" type="text" maxlength="200" placeholder="Reason (optional, sent to the user)">
+        <div id="usheet-actions" class="sheet-actions"></div>
+      </div>
+    </div>
 
     <!-- Job configuration sheet (from "Configure in Mini App") -->
     <div id="sheet" class="sheet hidden">

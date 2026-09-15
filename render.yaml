@@ -24,15 +24,21 @@ services:
         sync: false
       - key: BOT_TOKEN
         sync: false
-      # ── Access control ──
-      - key: SECURITY_CODE
-        sync: false
+      # ── Access control (approval based — the owner / admins approve users) ──
       - key: OWNER_ID              # your numeric Telegram ID (send /id to the bot)
         sync: false
-      - key: AUTHORIZED_USERS      # optional: comma-separated IDs kept after restarts
+      - key: ADMIN_USERS           # optional: comma-separated IDs that may approve users
         value: ""
-      - key: PUBLIC_MODE           # "1" → anyone can use the bot (no code)
+      - key: AUTHORIZED_USERS      # optional: comma-separated IDs with lifetime access
+        value: ""
+      - key: PUBLIC_MODE           # "1" → everyone is approved automatically
         value: "0"
+      - key: DEFAULT_APPROVAL      # duration for /approve without one: 1w · 1m · 1y · forever · 45d
+        value: "1m"
+      - key: EXPIRY_REMINDER_DAYS  # remind users N days before expiry (0 = off)
+        value: "3"
+      - key: REJECT_COOLDOWN_H     # hours before a rejected user may request again
+        value: "24"
       # ── MongoDB. Empty → built-in Atlas free-tier cluster · your own mongodb+srv://… · "off" = RAM-only ──
       - key: MONGO_URI
         sync: false

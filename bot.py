@@ -3,8 +3,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║        📚 NovelTranslator PRO  —  Telegram Document Translation Bot       ║
-║          v4.0  ·  MongoDB + Mini App edition for Render.com               ║
+║      v5.0  ·  Approval system + Admins · MongoDB + Mini App · Render     ║
 ╠══════════════════════════════════════════════════════════════════════════╣
+║  • Approval-based access (no password) → users request, owner/admins    ║
+║    approve for 1 week / month / year / lifetime / custom; auto-expiry,  ║
+║    reminders, re-request, reject, ban, audit log, admin roles           ║
 ║  • MongoDB persistence (motor)        → users / settings / stats / jobs  ║
 ║    survive restarts. Falls back to RAM when MONGO_URI is not set.        ║
 ║  • Telegram Mini App (/app)           → premium dashboard: settings,     ║
@@ -16,6 +19,7 @@
 """
 
 import asyncio
+import calendar
 import hashlib
 import hmac
 import html
@@ -31,6 +35,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl
 
@@ -117,13 +122,20 @@ def _env_int_list(name: str) -> List[int]:
 API_ID = _env_int("API_ID", 0)
 API_HASH = _env("API_HASH")
 BOT_TOKEN = _env("BOT_TOKEN")
-SECURITY_CODE = _env("SECURITY_CODE")
 OWNER_ID = _env_int("OWNER_ID", 0)
-AUTHORIZED_USERS = _env_int_list("AUTHORIZED_USERS")       # pre-authorised on boot
-PUBLIC_MODE = _env_bool("PUBLIC_MODE", False)              # True → no code needed
+AUTHORIZED_USERS = _env_int_list("AUTHORIZED_USERS")       # lifetime access on every boot
+ADMIN_USERS = _env_int_list("ADMIN_USERS")                 # pre-configured admins (can approve users)
+PUBLIC_MODE = _env_bool("PUBLIC_MODE", False)              # True → everyone is approved automatically
 BACKUP_GROUP_ID = _env_int("BACKUP_GROUP_ID", 0)           # 0 → backups disabled
+# Approval system
+DEFAULT_APPROVAL = _env("DEFAULT_APPROVAL", "1m")          # used by /adduser without a duration (1m · 1y · forever · 45d …)
+EXPIRY_REMINDER_DAYS = max(0, min(_env_int("EXPIRY_REMINDER_DAYS", 3), 30))
+REJECT_COOLDOWN_H = max(0, _env_int("REJECT_COOLDOWN_H", 24))  # hours before a rejected user may re-request
+LEGACY_USERS = _env("LEGACY_USERS", "keep").lower()        # v4 users unlocked with the old code: keep (lifetime) | reapprove
+AUDIT_LIMIT = 300                                          # audit entries kept in RAM / DB
 
 BOT_NAME = _env("BOT_NAME", "NovelTranslator PRO")
+VERSION = "5.0"
 CONCURRENCY_LIMIT = max(1, min(_env_int("CONCURRENCY", 8), 20))
 CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3500), 4800))
 MAX_RETRIES = 5
@@ -219,16 +231,116 @@ def validate_config() -> None:
     if not API_ID: problems.append("API_ID")
     if not API_HASH: problems.append("API_HASH")
     if not BOT_TOKEN or ":" not in BOT_TOKEN: problems.append("BOT_TOKEN")
-    if not PUBLIC_MODE and not SECURITY_CODE and not OWNER_ID and not AUTHORIZED_USERS:
-        problems.append("SECURITY_CODE (or OWNER_ID / AUTHORIZED_USERS / PUBLIC_MODE=1)")
+    if not OWNER_ID and not PUBLIC_MODE:
+        problems.append("OWNER_ID (your numeric Telegram ID — the owner approves access requests)")
     if problems:
         log.critical("Missing / invalid environment variables: %s", ", ".join(problems))
         log.critical("Set them in the Render dashboard → Environment, then redeploy.")
         sys.exit(1)
-    if SECURITY_CODE and len(SECURITY_CODE) < 6:
-        log.warning("SECURITY_CODE is very short — use at least 6 characters.")
+    if _env("SECURITY_CODE"):
+        log.warning("SECURITY_CODE is no longer used — access is approval based now (v5). You can remove the variable.")
 
 validate_config()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎫 ACCESS MODEL  —  approval states, plans & duration parsing
+# ═══════════════════════════════════════════════════════════════════════════
+ACCESS_NONE, ACCESS_PENDING, ACCESS_APPROVED = "none", "pending", "approved"
+ACCESS_EXPIRED, ACCESS_REJECTED, ACCESS_BANNED = "expired", "rejected", "banned"
+ACCESS_LABELS = {
+    ACCESS_NONE: ("No access", "🔒"), ACCESS_PENDING: ("Pending approval", "⏳"),
+    ACCESS_APPROVED: ("Approved", "✅"), ACCESS_EXPIRED: ("Expired", "⌛"),
+    ACCESS_REJECTED: ("Rejected", "❌"), ACCESS_BANNED: ("Banned", "🚫"),
+}
+# Quick-approve presets shown to admins (code → label, duration spec)
+PLAN_PRESETS: Dict[str, Tuple[str, str]] = {
+    "1w": ("1 Week", "1w"), "1m": ("1 Month", "1m"), "3m": ("3 Months", "3m"),
+    "6m": ("6 Months", "6m"), "1y": ("1 Year", "1y"), "forever": ("Lifetime", "forever"),
+}
+FOREVER_WORDS = {"forever", "lifetime", "permanent", "unlimited", "never", "always", "∞", "inf", "0"}
+
+def _add_months(dt: datetime, months: float) -> datetime:
+    whole = int(months)
+    frac = months - whole
+    month0 = dt.month - 1 + whole
+    year = dt.year + month0 // 12
+    month = month0 % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day) + timedelta(days=frac * 30)
+
+def parse_duration(text: str, start: Optional[float] = None) -> Optional[int]:
+    """Turn a human duration into an absolute expiry timestamp.
+    Returns 0 for lifetime, None when the text is not understood.
+
+      forever · lifetime · 30 · 30d · 2w · 1m (month) · 6mo · 1y · 12h · 2026-12-31
+    """
+    t = (text or "").strip().lower().replace(" ", "")
+    if not t:
+        return None
+    if t in FOREVER_WORDS:
+        return 0
+    start = start or time.time()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 23, 59, 59)
+        except ValueError:
+            return None
+        ts = int(dt.timestamp())
+        return ts if ts > start else None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|"
+                     r"m|mo|mon|month|months|y|yr|yrs|year|years)?", t)
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = (m.group(2) or "d")[0]
+    if n <= 0 or n > 100000:
+        return None
+    if unit == "h":
+        return int(start + n * 3600)
+    if unit == "d":
+        return int(start + n * 86400)
+    if unit == "w":
+        return int(start + n * 7 * 86400)
+    base = datetime.fromtimestamp(start)
+    if unit == "m":
+        return int(_add_months(base, n).timestamp())
+    if unit == "y":
+        return int(_add_months(base, n * 12).timestamp())
+    return None
+
+def plan_label(spec: str) -> str:
+    """Human label for a duration spec / preset code."""
+    if spec in PLAN_PRESETS:
+        return PLAN_PRESETS[spec][0]
+    if spec.lower() in FOREVER_WORDS:
+        return "Lifetime"
+    return spec or "—"
+
+def fmt_date(ts: float) -> str:
+    return time.strftime("%d %b %Y", time.localtime(ts)) if ts else "—"
+
+def fmt_datetime(ts: float) -> str:
+    return time.strftime("%d %b %Y · %H:%M", time.localtime(ts)) if ts else "—"
+
+def days_left(expires: int) -> Optional[int]:
+    """None → lifetime, otherwise whole days remaining (can be 0 = today)."""
+    if not expires:
+        return None
+    return max(0, int((expires - time.time()) // 86400))
+
+def expiry_label(expires: int) -> str:
+    if not expires:
+        return "♾ Lifetime"
+    left = expires - time.time()
+    if left <= 0:
+        return f"expired {fmt_date(expires)}"
+    d = int(left // 86400)
+    if d >= 1:
+        return f"until {fmt_date(expires)} ({d} day{'s' if d != 1 else ''} left)"
+    h = max(1, int(left // 3600))
+    return f"until {fmt_datetime(expires)} ({h} h left)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -239,23 +351,27 @@ class Store:
     additionally persisted to MongoDB (when MONGO_URI is configured) through a
     background writer queue, so handlers never block on the database.
 
-    Collections: users · stats (single doc) · jobs (history) · chats · meta
+    Collections: users · stats (single doc) · jobs (history) · chats · meta · audit
+
+    Access model (v5): every person who talks to the bot gets a profile with an
+    ``access`` block → {status, expires, plan, approved_by, …}. Only users whose
+    status is *approved* and whose expiry is in the future (or 0 = lifetime) can
+    translate. Owner + admins approve / extend / reject / ban.
 
     Bootstrapping on every start:
-      • OWNER_ID           → owner (if set)
-      • AUTHORIZED_USERS   → pre-authorised users
-      • MongoDB            → previously saved users / stats / history (if any)
-      • SECURITY_CODE      → anyone who sends it gets access (first one may
-                             become owner if OWNER_ID is not set)
+      • OWNER_ID           → owner (lifetime access, can promote admins)
+      • ADMIN_USERS        → admins (lifetime access, can approve users)
+      • AUTHORIZED_USERS   → lifetime approved users
+      • MongoDB            → previously saved users / stats / history / audit
     """
 
     def __init__(self):
         self.owner_id: int = OWNER_ID
-        self.security_code: str = SECURITY_CODE
         self.users: Dict[int, dict] = {}
         self.chats: Dict[int, dict] = {}
         self.stats = {"jobs": 0, "parts": 0, "chars": 0, "failed": 0, "cancelled": 0}
         self.history: Dict[int, Deque[dict]] = {}          # uid → recent jobs (newest first)
+        self.audit_log: Deque[dict] = deque(maxlen=AUDIT_LIMIT)
         self.booted = time.time()
         self.db = None                                      # motor database (or None)
         self.connected = False
@@ -267,10 +383,24 @@ class Store:
         self.db_checked: float = 0.0
         self.db_pruned_total: int = 0
         self._history_writes = 0                            # inserts since last budget check
+        self._apply_env_roles()
+
+    def _apply_env_roles(self) -> None:
+        """Env-configured people always win: owner → admins → lifetime users."""
         if OWNER_ID:
-            self.authorize(OWNER_ID, "Owner")
+            u = self.ensure_user(OWNER_ID, "Owner", save=False)
+            u["role"] = "owner"
+            self._grant(u, 0, 0, "env")
+        for uid in ADMIN_USERS:
+            if uid == OWNER_ID:
+                continue
+            u = self.ensure_user(uid, "Admin", save=False)
+            u["role"] = "admin"
+            self._grant(u, 0, 0, "env")
         for uid in AUTHORIZED_USERS:
-            self.authorize(uid, "Pre-authorized")
+            u = self.ensure_user(uid, "Pre-authorized", save=False)
+            if u["access"]["status"] != ACCESS_APPROVED or u["access"].get("expires"):
+                self._grant(u, 0, 0, "env")
 
     # ── MongoDB lifecycle ──────────────────────────────────────────────
     async def connect(self) -> bool:
@@ -330,33 +460,49 @@ class Store:
 
     async def _load(self) -> None:
         """Merge persisted state into the RAM cache. Env-configured users win."""
+        migrated = 0
         async for doc in self.db.users.find({}):
             try:
                 uid = int(doc["_id"])
             except (KeyError, TypeError, ValueError):
                 continue
             doc.pop("_id", None)
-            existing = self.users.get(uid)
             merged = {**self._default_user(doc.get("name", "User")), **doc}
             merged["stats"] = {**{"jobs": 0, "parts": 0, "chars": 0}, **(doc.get("stats") or {})}
-            if existing:
-                merged["role"] = existing["role"]
+            legacy = "access" not in doc
+            if legacy:
+                # v4 user (unlocked with the old security code) → migrate
+                merged["access"] = self._default_access()
+                if LEGACY_USERS == "keep":
+                    self._grant(merged, 0, 0, "env", plan="legacy")
+                migrated += 1
+            else:
+                merged["access"] = {**self._default_access(), **(doc.get("access") or {})}
+            if merged.get("role") not in ("owner", "admin", "user"):
+                merged["role"] = "user"
             self.users[uid] = merged
-        if uid_ := self.owner_id:
-            if uid_ in self.users:
-                self.users[uid_]["role"] = "owner"
+            if legacy:
+                self._save_user(uid)
+        if migrated:
+            log.info("Migrated %d legacy users to the approval system (LEGACY_USERS=%s)", migrated, LEGACY_USERS)
+        # env roles are re-applied on top of whatever was stored
+        self._apply_env_roles()
         s = await self.db.stats.find_one({"_id": "global"})
         if s:
             for k in self.stats:
                 self.stats[k] = int(s.get(k, 0) or 0)
         meta = await self.db.meta.find_one({"_id": "meta"})
-        if meta:
-            if not self.owner_id and meta.get("owner_id"):
-                self.owner_id = int(meta["owner_id"])
-                if self.owner_id in self.users:
-                    self.users[self.owner_id]["role"] = "owner"
-            if not SECURITY_CODE and meta.get("security_code"):
-                self.security_code = meta["security_code"]
+        if meta and not self.owner_id and meta.get("owner_id"):
+            self.owner_id = int(meta["owner_id"])
+            if self.owner_id in self.users:
+                self.users[self.owner_id]["role"] = "owner"
+        try:
+            cursor = self.db.audit.find({}, {"_id": 0}).sort("ts", -1).limit(AUDIT_LIMIT)
+            rows = [d async for d in cursor]
+            for d in reversed(rows):
+                self.audit_log.append(d)
+        except Exception as e:
+            log.debug("audit load: %s", e)
         async for doc in self.db.chats.find({}):
             try:
                 self.chats[int(doc["_id"])] = {"title": doc.get("title", "Chat"), "type": doc.get("type", "group"),
@@ -425,16 +571,25 @@ class Store:
             if cutoff:
                 r = await self.db.jobs.delete_many({"ts": {"$lt": cutoff[0]["ts"]}})
                 removed += r.deleted_count
-        # 3) users never seen for a year and with zero jobs are just noise
+        # 3) visitors never seen for a year, with zero jobs and no active access are just noise
         stale = int(time.time()) - 365 * 24 * 3600
         try:
-            r = await self.db.users.delete_many({"last_seen": {"$lt": stale}, "stats.jobs": 0,
-                                                 "role": {"$ne": "owner"}})
+            q = {"last_seen": {"$lt": stale}, "stats.jobs": 0, "role": "user",
+                 "access.status": {"$nin": [ACCESS_APPROVED, ACCESS_BANNED]}}
+            r = await self.db.users.delete_many(q)
             for uid in [u for u, d in list(self.users.items())
                         if d.get("last_seen", 0) < stale and not d.get("stats", {}).get("jobs")
-                        and d.get("role") != "owner" and u not in AUTHORIZED_USERS]:
+                        and d.get("role") == "user" and u not in AUTHORIZED_USERS
+                        and d.get("access", {}).get("status") not in (ACCESS_APPROVED, ACCESS_BANNED)]:
                 self.users.pop(uid, None)
             removed += r.deleted_count
+            # audit log: keep the collection tiny
+            n_audit = await self.db.audit.estimated_document_count()
+            if n_audit > AUDIT_LIMIT * 2:
+                cutoff = await self.db.audit.find({}, {"ts": 1}).sort("ts", -1).skip(AUDIT_LIMIT).limit(1).to_list(1)
+                if cutoff:
+                    r = await self.db.audit.delete_many({"ts": {"$lt": cutoff[0]["ts"]}})
+                    removed += r.deleted_count
         except Exception as e:
             log.debug("stale user prune: %s", e)
         if removed:
@@ -491,35 +646,49 @@ class Store:
         self._enqueue(lambda: self.db.stats.replace_one({"_id": "global"}, snapshot, upsert=True))
 
     def _save_meta(self) -> None:
-        snapshot = {"owner_id": self.owner_id, "security_code": self.security_code, "updated": int(time.time())}
+        snapshot = {"owner_id": self.owner_id, "updated": int(time.time())}
         self._enqueue(lambda: self.db.meta.update_one({"_id": "meta"}, {"$set": snapshot}, upsert=True))
 
     @staticmethod
-    def _default_user(name: str) -> dict:
-        return {"name": name, "joined": int(time.time()), "role": "user",
+    def _default_access() -> dict:
+        return {"status": ACCESS_NONE, "expires": 0, "plan": "", "approved_by": 0, "approved_at": 0,
+                "requested_at": 0, "requests": 0, "note": "", "reason": "", "updated": 0,
+                "reminded": 0, "history": []}
+
+    @classmethod
+    def _default_user(cls, name: str) -> dict:
+        return {"name": name, "username": "", "joined": int(time.time()), "role": "user",
                 "lang": DEFAULT_LANG, "fmt": DEFAULT_FORMAT, "split": DEFAULT_SPLIT_KB,
                 "last_seen": int(time.time()),
-                "stats": {"jobs": 0, "parts": 0, "chars": 0}}
+                "stats": {"jobs": 0, "parts": 0, "chars": 0},
+                "access": cls._default_access()}
 
     # ── users ──────────────────────────────────────────────────────────
     def user(self, uid: int) -> Optional[dict]:
         return self.users.get(uid)
 
-    def ensure_user(self, uid: int, name: str) -> dict:
-        """Create a profile on first contact (PUBLIC_MODE) / refresh the name."""
+    def ensure_user(self, uid: int, name: str, username: str = "", save: bool = True) -> dict:
+        """Create a profile on first contact / refresh the display name."""
         u = self.users.get(uid)
         changed = False
         if u is None:
             u = self._default_user(name or "User")
             self.users[uid] = u
             changed = True
-        elif name and u.get("name") != name:
-            u["name"] = name
+        else:
+            if name and u.get("name") != name and name not in ("Owner", "Admin", "Pre-authorized", "User"):
+                u["name"] = name
+                changed = True
+            if "access" not in u:
+                u["access"] = self._default_access()
+                changed = True
+        if username and u.get("username") != username:
+            u["username"] = username
             changed = True
         if uid == self.owner_id and u.get("role") != "owner":
             u["role"] = "owner"
             changed = True
-        if changed:
+        if changed and save:
             self._save_user(uid)
         return u
 
@@ -529,32 +698,250 @@ class Store:
             u["last_seen"] = int(time.time())
             self._save_user(uid)
 
-    def is_authorized(self, uid: int) -> bool:
-        return PUBLIC_MODE or uid in self.users
-
-    def authorize(self, uid: int, name: str) -> dict:
-        u = self.ensure_user(uid, name)
-        if not self.owner_id:
-            self.owner_id = uid
-            self._save_meta()
-        if uid == self.owner_id and u.get("role") != "owner":
-            u["role"] = "owner"
-        self._save_user(uid)
-        return u
-
-    def revoke(self, uid: int) -> bool:
-        if uid in self.users and uid != self.owner_id:
-            del self.users[uid]
-            self._delete_user(uid)
-            return True
-        return False
-
+    # ── roles ──────────────────────────────────────────────────────────
     def is_owner(self, uid: int) -> bool:
         return bool(self.owner_id) and uid == self.owner_id
 
-    def set_security_code(self, code_: str) -> None:
-        self.security_code = code_
-        self._save_meta()
+    def is_admin(self, uid: int) -> bool:
+        """Owner or promoted admin — may approve / reject / extend users."""
+        if self.is_owner(uid):
+            return True
+        u = self.users.get(uid)
+        return bool(u and u.get("role") == "admin")
+
+    def role(self, uid: int) -> str:
+        if self.is_owner(uid):
+            return "owner"
+        u = self.users.get(uid)
+        return u.get("role", "user") if u else "user"
+
+    def set_admin(self, uid: int, make_admin: bool, by: int) -> bool:
+        """Promote / demote. Admins automatically get lifetime access."""
+        if self.is_owner(uid):
+            return False
+        u = self.ensure_user(uid, "Admin" if make_admin else "User")
+        if make_admin:
+            if u.get("role") == "admin":
+                return False
+            u["role"] = "admin"
+            self._grant(u, 0, by, "admin", plan="forever")
+            self.audit("promote", by, uid)
+        else:
+            if u.get("role") != "admin":
+                return False
+            u["role"] = "user"
+            self.audit("demote", by, uid)
+        self._save_user(uid)
+        return True
+
+    def admins(self) -> List[int]:
+        ids = [uid for uid, u in self.users.items() if u.get("role") == "admin"]
+        if self.owner_id:
+            ids.insert(0, self.owner_id)
+        return ids
+
+    # ── access / approval ──────────────────────────────────────────────
+    def access(self, uid: int) -> dict:
+        """Current access block with lazy expiry (approved + past expiry → expired)."""
+        u = self.users.get(uid)
+        if not u:
+            return self._default_access()
+        a = u.setdefault("access", self._default_access())
+        if a["status"] == ACCESS_APPROVED and a.get("expires") and a["expires"] <= time.time() \
+                and not self.is_owner(uid):
+            a["status"] = ACCESS_EXPIRED
+            a["updated"] = int(time.time())
+            self._push_hist(a, {"action": "expired"})
+            self._save_user(uid)
+            self.audit("expired", 0, uid)
+        return a
+
+    def status(self, uid: int) -> str:
+        if self.is_owner(uid):
+            return ACCESS_APPROVED
+        return self.access(uid)["status"]
+
+    def is_authorized(self, uid: int) -> bool:
+        """Can this person use the translator right now?"""
+        if self.is_owner(uid):
+            return True
+        if uid not in self.users:
+            return PUBLIC_MODE
+        a = self.access(uid)
+        if a["status"] == ACCESS_BANNED:
+            return False
+        if PUBLIC_MODE:
+            return True
+        return a["status"] == ACCESS_APPROVED
+
+    def is_banned(self, uid: int) -> bool:
+        u = self.users.get(uid)
+        return bool(u and u.get("access", {}).get("status") == ACCESS_BANNED)
+
+    @staticmethod
+    def _push_hist(a: dict, entry: dict) -> None:
+        h = a.setdefault("history", [])
+        h.append({"ts": int(time.time()), **entry})
+        if len(h) > 12:
+            del h[:-12]
+
+    def _grant(self, u: dict, expires: int, by: int, source: str, plan: str = "") -> None:
+        a = u.setdefault("access", self._default_access())
+        a.update({"status": ACCESS_APPROVED, "expires": int(expires or 0), "approved_by": by,
+                  "approved_at": int(time.time()), "plan": plan or ("forever" if not expires else a.get("plan", "")),
+                  "updated": int(time.time()), "reminded": 0, "reason": ""})
+        if source != "env":
+            self._push_hist(a, {"action": "approve", "by": by, "expires": int(expires or 0), "plan": a["plan"]})
+
+    def request_access(self, uid: int, name: str, username: str = "", note: str = "") -> Tuple[bool, str]:
+        """User asks for approval. Returns (ok, reason)."""
+        self.ensure_user(uid, name, username)
+        a = self.access(uid)
+        now = int(time.time())
+        if a["status"] == ACCESS_BANNED:
+            return False, "banned"
+        if a["status"] == ACCESS_APPROVED or self.is_owner(uid):
+            return False, "approved"
+        if a["status"] == ACCESS_PENDING:
+            return False, "pending"
+        if a["status"] == ACCESS_REJECTED and REJECT_COOLDOWN_H and a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 > now:
+            return False, "cooldown"
+        a.update({"status": ACCESS_PENDING, "requested_at": now, "requests": int(a.get("requests", 0)) + 1,
+                  "note": (note or "")[:200], "updated": now})
+        self._push_hist(a, {"action": "request"})
+        self._save_user(uid)
+        self.audit("request", uid, uid, note=(note or "")[:80])
+        return True, "ok"
+
+    def approve(self, uid: int, spec: str, by: int, name: str = "", extend: bool = False) -> Optional[dict]:
+        """Approve (or extend) access. `spec` is a duration (1m, 1y, forever, 45d, 2026-12-31).
+        extend=True adds the duration on top of a still-valid expiry."""
+        u = self.ensure_user(uid, name or "User")
+        a = self.access(uid)
+        if a["status"] == ACCESS_BANNED:
+            return None
+        start = time.time()
+        if extend and a["status"] == ACCESS_APPROVED:
+            if not a.get("expires"):
+                return a                               # already lifetime — nothing to extend
+            start = max(start, a["expires"])
+        expires = parse_duration(spec, start)
+        if expires is None:
+            return None
+        plan = spec if spec in PLAN_PRESETS else ("forever" if expires == 0 else spec)
+        self._grant(u, expires, by, "admin", plan=plan)
+        self._save_user(uid)
+        self.audit("extend" if extend else "approve", by, uid, plan=plan, expires=expires)
+        return a
+
+    def reject(self, uid: int, by: int, reason: str = "") -> bool:
+        u = self.users.get(uid)
+        if not u or self.is_owner(uid):
+            return False
+        a = self.access(uid)
+        a.update({"status": ACCESS_REJECTED, "reason": (reason or "")[:200], "updated": int(time.time()),
+                  "expires": 0, "plan": ""})
+        self._push_hist(a, {"action": "reject", "by": by, "reason": (reason or "")[:80]})
+        self._save_user(uid)
+        self.audit("reject", by, uid, reason=(reason or "")[:80])
+        return True
+
+    def revoke(self, uid: int, by: int = 0, reason: str = "") -> bool:
+        """Remove access but keep the profile (stats / history stay)."""
+        u = self.users.get(uid)
+        if not u or self.is_owner(uid):
+            return False
+        a = self.access(uid)
+        if a["status"] not in (ACCESS_APPROVED, ACCESS_EXPIRED, ACCESS_PENDING):
+            return False
+        if u.get("role") == "admin":
+            u["role"] = "user"
+        a.update({"status": ACCESS_NONE, "expires": 0, "plan": "", "reason": (reason or "")[:200],
+                  "updated": int(time.time())})
+        self._push_hist(a, {"action": "revoke", "by": by})
+        self._save_user(uid)
+        self.audit("revoke", by, uid, reason=(reason or "")[:80])
+        return True
+
+    def ban(self, uid: int, by: int, reason: str = "") -> bool:
+        if self.is_owner(uid):
+            return False
+        u = self.ensure_user(uid, "User")
+        if u.get("role") == "admin":
+            u["role"] = "user"
+        a = self.access(uid)
+        a.update({"status": ACCESS_BANNED, "expires": 0, "plan": "", "reason": (reason or "")[:200],
+                  "updated": int(time.time())})
+        self._push_hist(a, {"action": "ban", "by": by, "reason": (reason or "")[:80]})
+        self._save_user(uid)
+        self.audit("ban", by, uid, reason=(reason or "")[:80])
+        return True
+
+    def unban(self, uid: int, by: int) -> bool:
+        u = self.users.get(uid)
+        if not u or u.get("access", {}).get("status") != ACCESS_BANNED:
+            return False
+        u["access"].update({"status": ACCESS_NONE, "reason": "", "updated": int(time.time())})
+        self._push_hist(u["access"], {"action": "unban", "by": by})
+        self._save_user(uid)
+        self.audit("unban", by, uid)
+        return True
+
+    def approved_users(self) -> List[int]:
+        return [uid for uid in list(self.users) if self.is_authorized(uid)]
+
+    def pending_users(self) -> List[Tuple[int, dict]]:
+        rows = [(uid, u) for uid, u in self.users.items() if u.get("access", {}).get("status") == ACCESS_PENDING]
+        rows.sort(key=lambda kv: kv[1]["access"].get("requested_at", 0))
+        return rows
+
+    def count_by_status(self) -> Dict[str, int]:
+        out = {k: 0 for k in ACCESS_LABELS}
+        for uid in list(self.users):
+            out[self.status(uid)] = out.get(self.status(uid), 0) + 1
+        return out
+
+    def sweep_expired(self) -> List[int]:
+        """Mark approved users whose time is over as expired. Returns their ids."""
+        out = []
+        now = time.time()
+        for uid, u in list(self.users.items()):
+            a = u.get("access") or {}
+            if a.get("status") == ACCESS_APPROVED and a.get("expires") and a["expires"] <= now and not self.is_owner(uid):
+                self.access(uid)                        # lazy expiry does the bookkeeping
+                out.append(uid)
+        return out
+
+    def due_reminders(self) -> List[Tuple[int, int]]:
+        """Approved users expiring within EXPIRY_REMINDER_DAYS that were not reminded yet."""
+        if not EXPIRY_REMINDER_DAYS:
+            return []
+        now = time.time()
+        out = []
+        for uid, u in self.users.items():
+            a = u.get("access") or {}
+            exp = a.get("expires") or 0
+            if a.get("status") == ACCESS_APPROVED and exp and now < exp <= now + EXPIRY_REMINDER_DAYS * 86400 \
+                    and not a.get("reminded"):
+                a["reminded"] = int(now)
+                self._save_user(uid)
+                out.append((uid, exp))
+        return out
+
+    # ── audit log ──────────────────────────────────────────────────────
+    def audit(self, action: str, actor: int, target: int, **extra) -> None:
+        entry = {"ts": int(time.time()), "action": action, "actor": int(actor or 0), "target": int(target or 0),
+                 "actor_name": ((self.users.get(actor) or {}).get("name", "") if actor else "system"),
+                 "target_name": (self.users.get(target) or {}).get("name", "")}
+        for k, v in extra.items():
+            if v not in (None, "") and (v != 0 or k == "expires"):
+                entry[k] = v
+        self.audit_log.append(entry)
+        snap = dict(entry)
+        self._enqueue(lambda: self.db.audit.insert_one(dict(snap)))
+
+    def recent_audit(self, limit: int = 40) -> List[dict]:
+        return list(self.audit_log)[-limit:][::-1]
 
     # ── prefs & stats ──────────────────────────────────────────────────
     def pref(self, uid: int, key: str, default=None):
@@ -562,12 +949,9 @@ class Store:
         return u.get(key, default) if u else default
 
     def set_pref(self, uid: int, key: str, value):
-        u = self.users.get(uid)
-        if u is None and PUBLIC_MODE:
-            u = self.ensure_user(uid, "User")
-        if u is not None:
-            u[key] = value
-            self._save_user(uid)
+        u = self.users.get(uid) or self.ensure_user(uid, "User")
+        u[key] = value
+        self._save_user(uid)
 
     def bump(self, uid: int, parts: int, chars: int, failed=False, cancelled=False):
         u = self.users.get(uid)
@@ -700,10 +1084,11 @@ def back_home_kb() -> InlineKeyboardMarkup:
 # ── Reply keyboard (persistent bottom menu) — hierarchical & role based ────
 # The bottom keyboard is organised as small *pages* instead of one big grid:
 #
-#   MAIN      →  📱 Mini App | 🛠 Tools | ⚙️ Settings | 👑 Admin (owner) | ℹ️ Help
+#   MAIN      →  📱 Mini App | 🛠 Tools | ⚙️ Settings | 👑 Admin (owner/admin) | ℹ️ Help
 #   TOOLS     →  📋 Queue | 📊 My Stats | 🛑 Cancel Job | 🆔 My ID | ◀️ Back
 #   SETTINGS  →  🌐 Language | 📄 Format | ✂️ Split | 📱 Mini App | ◀️ Back
-#   ADMIN     →  👑 Owner Panel | 👥 Users | 📣 Broadcast | 🔗 Links | ◀️ Back
+#   ADMIN     →  ⏳ Requests | 👥 Users | 👑 Owner Panel | 📣 Broadcast | 🔗 Links | ◀️ Back
+#   LOCKED    →  🙋 Request Access | 🆔 My ID          (people without approval)
 #
 # Tapping a menu button *replaces* the keyboard with that sub-page, so only
 # 3–5 buttons are ever visible at once. Every leaf maps to a command.
@@ -726,19 +1111,27 @@ BTN_SPLIT     = "✂️ Split size"
 
 BTN_OWNER     = "👑 Owner Panel"
 BTN_USERS     = "👥 Users"
+BTN_PENDING   = "⏳ Requests"
 BTN_BROADCAST = "📣 Broadcast"
 BTN_LINKS     = "🔗 Links"
+BTN_REQUEST   = "🙋 Request Access"
+BTN_MYACCESS  = "🎫 My Access"
 
 # Leaf buttons → command they trigger
 USER_BUTTONS: Dict[str, str] = {
     BTN_HOME: "start", BTN_HELP: "help", BTN_QUEUE: "queue", BTN_MYSTATS: "mystats",
-    BTN_CANCEL: "cancel", BTN_MYID: "id", BTN_SETTINGS: "settings",
+    BTN_CANCEL: "cancel", BTN_MYID: "id", BTN_SETTINGS: "settings", BTN_MYACCESS: "access",
     BTN_LANG: "setlang", BTN_FORMAT: "setformat", BTN_SPLIT: "setsplit", BTN_APP: "app",
 }
-OWNER_BUTTONS: Dict[str, str] = {
-    BTN_OWNER: "stats", BTN_USERS: "users", BTN_BROADCAST: "broadcast", BTN_LINKS: "links",
+# Admin buttons (owner + promoted admins)
+ADMIN_BUTTONS: Dict[str, str] = {
+    BTN_PENDING: "pending", BTN_USERS: "users",
 }
-ALL_BUTTONS: Dict[str, str] = {**USER_BUTTONS, **OWNER_BUTTONS}
+# Owner-only buttons
+OWNER_BUTTONS: Dict[str, str] = {
+    BTN_OWNER: "stats", BTN_BROADCAST: "broadcast", BTN_LINKS: "links",
+}
+ALL_BUTTONS: Dict[str, str] = {**USER_BUTTONS, **ADMIN_BUTTONS, **OWNER_BUTTONS}
 # Buttons that only switch the keyboard page (no command)
 MENU_BUTTONS = {BTN_TOOLS: "tools", BTN_ADMIN: "admin", BTN_BACK: "main"}
 KB_PAGE: Dict[int, str] = {}      # chat_id → current keyboard page (RAM only)
@@ -749,47 +1142,56 @@ def _app_button() -> KeyboardButton:
     return KeyboardButton(BTN_APP)
 
 def reply_keyboard(uid: int, page: str = "main") -> ReplyKeyboardMarkup:
-    """Bottom keyboard for the given page. Owner gets the extra Admin page."""
+    """Bottom keyboard for the given page. Owner/admins get the extra Admin page."""
     owner = store.is_owner(uid)
+    admin = store.is_admin(uid)
     if page == "tools":
         rows = [[KeyboardButton(BTN_QUEUE), KeyboardButton(BTN_MYSTATS)],
-                [KeyboardButton(BTN_CANCEL), KeyboardButton(BTN_MYID)],
-                [KeyboardButton(BTN_BACK)]]
+                [KeyboardButton(BTN_CANCEL), KeyboardButton(BTN_MYACCESS)],
+                [KeyboardButton(BTN_MYID), KeyboardButton(BTN_BACK)]]
         ph = "🛠 Tools — pick an action…"
     elif page == "settings":
         rows = [[KeyboardButton(BTN_LANG), KeyboardButton(BTN_FORMAT)],
                 [KeyboardButton(BTN_SPLIT), _app_button()],
                 [KeyboardButton(BTN_BACK)]]
         ph = "⚙️ Settings — what to change?"
-    elif page == "admin" and owner:
-        rows = [[KeyboardButton(BTN_OWNER), KeyboardButton(BTN_USERS)],
-                [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_LINKS)],
-                [KeyboardButton(BTN_BACK)]]
-        ph = "👑 Admin — owner tools…"
+    elif page == "admin" and admin:
+        rows = [[KeyboardButton(BTN_PENDING), KeyboardButton(BTN_USERS)]]
+        if owner:
+            rows.append([KeyboardButton(BTN_OWNER), KeyboardButton(BTN_BROADCAST)])
+            rows.append([KeyboardButton(BTN_LINKS), KeyboardButton(BTN_BACK)])
+        else:
+            rows.append([KeyboardButton(BTN_BACK)])
+        ph = "👑 Admin — approve requests, manage users…"
     else:
         page = "main"
         rows = [[_app_button()],
                 [KeyboardButton(BTN_TOOLS), KeyboardButton(BTN_SETTINGS)],
-                [KeyboardButton(BTN_ADMIN), KeyboardButton(BTN_HELP)] if owner else [KeyboardButton(BTN_HELP)]]
+                [KeyboardButton(BTN_ADMIN), KeyboardButton(BTN_HELP)] if admin else [KeyboardButton(BTN_HELP)]]
         ph = "📎 Send a document or open a menu…"
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, placeholder=ph)
 
-def locked_keyboard() -> ReplyKeyboardMarkup:
-    """Minimal keyboard for people who are not unlocked yet."""
-    return ReplyKeyboardMarkup([[KeyboardButton(BTN_MYID)]], resize_keyboard=True, is_persistent=True,
-                               placeholder="🔒 Send the security code…")
+def locked_keyboard(status: str = ACCESS_NONE) -> ReplyKeyboardMarkup:
+    """Minimal keyboard for people who are not approved (yet)."""
+    if status in (ACCESS_PENDING, ACCESS_BANNED):
+        rows = [[KeyboardButton(BTN_MYACCESS), KeyboardButton(BTN_MYID)]]
+        ph = "⏳ Waiting for approval…" if status == ACCESS_PENDING else "🚫 Access blocked"
+    else:
+        rows = [[KeyboardButton(BTN_REQUEST)], [KeyboardButton(BTN_MYACCESS), KeyboardButton(BTN_MYID)]]
+        ph = "🔒 Tap “Request Access” to get started…"
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, placeholder=ph)
 
 PAGE_TITLES = {
     "main": ("Main Menu", "🏠", "Choose a section below.\n📱 Mini App opens the full dashboard."),
-    "tools": ("Tools", "🛠", "Queue · stats · cancel · your ID"),
+    "tools": ("Tools", "🛠", "Queue · stats · cancel · access · your ID"),
     "settings": ("Settings", "⚙️", "Change your defaults for ⚡ Quick Start."),
-    "admin": ("Admin", "👑", "Owner tools — users, broadcast, links."),
+    "admin": ("Admin", "👑", "Approve requests, manage users, broadcast."),
 }
 
 async def show_page(m: Message, page: str, note: str = "") -> None:
     """Swap the bottom keyboard to another page (short confirmation message)."""
     uid = m.from_user.id
-    if page == "admin" and not store.is_owner(uid):
+    if page == "admin" and not store.is_admin(uid):
         page = "main"
     KB_PAGE[m.chat.id] = page
     title, icon, hint = PAGE_TITLES[page]
@@ -804,21 +1206,32 @@ USER_COMMANDS = [
     BotCommand("queue",    "📋 Current queue status"),
     BotCommand("cancel",   "🛑 Cancel your active / queued jobs"),
     BotCommand("mystats",  "📊 Your usage statistics"),
+    BotCommand("access",   "🎫 Your access plan & expiry"),
     BotCommand("help",     "ℹ️ How to use the bot"),
     BotCommand("id",       "🆔 Show your Telegram ID"),
 ]
-OWNER_COMMANDS = USER_COMMANDS + [
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand("pending",   "⏳ Access requests waiting for approval"),
+    BotCommand("users",     "👥 List users & their access"),
+    BotCommand("approve",   "✅ /approve <id> [1w|1m|1y|forever|45d]"),
+    BotCommand("extend",    "➕ /extend <id> <duration>"),
+    BotCommand("reject",    "❌ /reject <id> [reason]"),
+    BotCommand("revoke",    "🔒 /revoke <id> — remove access"),
+    BotCommand("ban",       "🚫 /ban <id> [reason]  ·  /unban <id>"),
+    BotCommand("userinfo",  "🔎 /userinfo <id> — profile & access"),
+]
+OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand("stats",     "👑 Owner panel / global stats"),
-    BotCommand("users",     "👥 List authorized users"),
-    BotCommand("adduser",   "➕ Authorize a user: /adduser <id>"),
-    BotCommand("deluser",   "➖ Revoke a user: /deluser <id>"),
+    BotCommand("admins",    "🛡 List admins · /addadmin <id> · /deladmin <id>"),
+    BotCommand("audit",     "📜 Recent access actions"),
     BotCommand("broadcast", "📣 Message all users (text or reply)"),
-    BotCommand("setcode",   "🔐 Change the security code"),
     BotCommand("links",     "🔗 Invite links of admin chats"),
 ]
 LOCKED_COMMANDS = [
-    BotCommand("start", "🔒 Unlock the bot with the security code"),
-    BotCommand("id",    "🆔 Show your Telegram ID"),
+    BotCommand("start",   "🔒 Request access to the bot"),
+    BotCommand("request", "🙋 Ask the owner for approval"),
+    BotCommand("access",  "🎫 Check your request status"),
+    BotCommand("id",      "🆔 Show your Telegram ID"),
 ]
 _COMMANDS_SET: set = set()   # chat ids that already have per-chat commands
 
@@ -832,10 +1245,15 @@ async def set_global_commands() -> None:
             log.debug("set_bot_commands(%s): %s", scope, e)
 
 async def set_user_commands(uid: int, force: bool = False) -> None:
-    """Per-chat scope: authorized users get user commands, the owner gets everything."""
+    """Per-chat scope: approved users → user commands, admins → + approval tools, owner → everything."""
     if not uid or (uid in _COMMANDS_SET and not force):
         return
-    cmds = OWNER_COMMANDS if store.is_owner(uid) else USER_COMMANDS
+    if store.is_owner(uid):
+        cmds = OWNER_COMMANDS
+    elif store.is_admin(uid):
+        cmds = ADMIN_COMMANDS
+    else:
+        cmds = USER_COMMANDS
     try:
         await app.set_bot_commands(cmds, scope=BotCommandScopeChat(uid))
         _COMMANDS_SET.add(uid)
@@ -860,6 +1278,18 @@ def user_prefs(uid: int) -> Tuple[str, str, int]:
     except (TypeError, ValueError): split = DEFAULT_SPLIT_KB
     return lang, fmt, split
 
+def access_line(uid: int) -> str:
+    """One-line access summary used on the home screen."""
+    if store.is_owner(uid):
+        return "👑 Owner · ♾ Lifetime"
+    a = store.access(uid)
+    role = store.role(uid)
+    if a["status"] == ACCESS_APPROVED:
+        prefix = "🛡 Admin · " if role == "admin" else ""
+        return prefix + ("♾ Lifetime" if not a.get("expires") else expiry_label(a["expires"]))
+    label, icon = ACCESS_LABELS.get(a["status"], ("Unknown", "❓"))
+    return f"{icon} {label}"
+
 def text_home(uid: int, name: str) -> str:
     lang, fmt, split = user_prefs(uid)
     return (
@@ -873,6 +1303,7 @@ def text_home(uid: int, name: str) -> str:
         f"🌐 Language: {b(lang_label(lang))}\n"
         f"📄 Format: {b(fmt.upper())}\n"
         f"✂️ Split: {b(split_label(split))}\n"
+        f"🎫 Access: {b(access_line(uid))}\n"
         f"{DIV}\n"
         f"<i>Tip: change defaults in ⚙️ Settings\nand use ⚡ Quick Start next time.</i>"
         + ("\n<i>📱 Tap <b>Mini App</b> for the full dashboard.</i>" if MINI_APP_URL.startswith("https://") else "")
@@ -892,6 +1323,7 @@ def text_help() -> str:
         "/queue – Current queue status\n"
         "/cancel – Cancel your active job\n"
         "/mystats – Your usage statistics\n"
+        "/access – Your access plan & expiry\n"
         "/help – This message\n"
         "/id – Your Telegram ID\n\n"
         f"{b('Menu')}\n"
@@ -1380,12 +1812,43 @@ async def queue_worker():
             ACTIVE = None
             job.cleanup()
 
+async def access_sweep() -> None:
+    """Expire finished plans, notify the user, remind people whose plan ends soon."""
+    for uid in store.sweep_expired():
+        await clear_user_commands(uid)
+        # drop their queued / pending work — they can no longer use the bot
+        for j in [j for j in QUEUE if j.user_id == uid]:
+            QUEUE.remove(j); j.status = "cancelled"; j.cleanup()
+        for jid, j in [(k, v) for k, v in PENDING.items() if v.user_id == uid]:
+            PENDING.pop(jid, None); j.cleanup()
+        await safe_send(uid, header("Access Expired", "⌛") +
+                        "Your access plan has ended.\n"
+                        "Tap 🙋 <b>Request Access</b> to ask for a renewal.",
+                        reply_markup=locked_keyboard(ACCESS_EXPIRED))
+        if store.admins():
+            await notify_admins(f"⌛ Access of {user_line(uid)} expired.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("➕ 1 Month", callback_data=f"ap:{uid}:1m"),
+                                                       InlineKeyboardButton("➕ 1 Year", callback_data=f"ap:{uid}:1y"),
+                                                       InlineKeyboardButton("🔎 Profile", callback_data=f"ui:{uid}")]]))
+    for uid, exp in store.due_reminders():
+        left = days_left(exp)
+        when = "today" if not left else f"in {left} day{'s' if left != 1 else ''}"
+        await safe_send(uid, header("Plan Ending Soon", "🔔") +
+                        f"Your access expires {b(when)} ({fmt_datetime(exp)}).\n"
+                        "Ask the owner for an extension if you want to keep translating.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎫 My Access", callback_data="nav:access")]]))
+        store.audit("reminder", 0, uid, expires=exp)
+
 async def janitor():
     while not SHUTTING_DOWN:
         await asyncio.sleep(300)
         now = time.time()
         if store.connected:
             await store.check_budget()
+        try:
+            await access_sweep()
+        except Exception as e:
+            log.warning("access sweep failed: %s", e)
         for jid, job in list(PENDING.items()):
             if now - job.created > PENDING_TTL:
                 job.cleanup()
@@ -1724,48 +2187,339 @@ async def _auth_cb(_, __, q: CallbackQuery):
 async def _owner_msg(_, __, m: Message):
     return bool(m.from_user and store.is_owner(m.from_user.id))
 
+async def _admin_msg(_, __, m: Message):
+    return bool(m.from_user and store.is_admin(m.from_user.id))
+
 authorized = filters.create(_auth_msg)
 authorized_cb = filters.create(_auth_cb)
 owner_only = filters.create(_owner_msg)
+admin_only = filters.create(_admin_msg)
 PRIVATE = filters.private & filters.incoming
 OUTPUT_NAME_RE = re.compile(r"^Part\s*\d+\s*(of\s*\d+)?\s*\|", re.IGNORECASE)
 
 def touch_user(m: Message) -> None:
-    """In PUBLIC_MODE make sure a profile exists so prefs/stats work."""
-    if PUBLIC_MODE and m.from_user:
-        store.ensure_user(m.from_user.id, m.from_user.first_name or "User")
+    """Make sure a profile exists / the display name is fresh so prefs & stats work."""
+    if m.from_user:
+        store.ensure_user(m.from_user.id, m.from_user.first_name or "User", m.from_user.username or "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔒 UNAUTHORIZED
+# 🎫 ACCESS REQUESTS  —  texts, keyboards & admin notifications
 # ═══════════════════════════════════════════════════════════════════════════
+def user_link(uid: int, name: str = "") -> str:
+    u = store.user(uid) or {}
+    name = name or u.get("name") or "User"
+    return f'<a href="tg://user?id={uid}">{esc(name)}</a>'
+
+def user_line(uid: int) -> str:
+    """`Name (@username) · 123456` for admin lists."""
+    u = store.user(uid) or {}
+    un = f" (@{esc(u['username'])})" if u.get("username") else ""
+    return f"{user_link(uid)}{un} · {code(uid)}"
+
+def text_access(uid: int) -> str:
+    """The user's own access card (/access)."""
+    a = store.access(uid)
+    status = store.status(uid)
+    label, icon = ACCESS_LABELS.get(status, ("Unknown", "❓"))
+    lines = [header("My Access", "🎫"),
+             f"{icon} Status: {b(label)}",
+             f"🎖 Role: {b(store.role(uid).title())}"]
+    if status == ACCESS_APPROVED:
+        if store.is_owner(uid) or not a.get("expires"):
+            lines.append("⏳ Valid: " + b("♾ Lifetime"))
+        else:
+            lines.append(f"📦 Plan: {b(plan_label(a.get('plan', '')))}")
+            lines.append(f"⏳ Valid: {b(expiry_label(a['expires']))}")
+            lines.append(f"📅 Expires: {b(fmt_datetime(a['expires']))}")
+        if a.get("approved_at") and not store.is_owner(uid):
+            lines.append(f"✅ Approved: {b(fmt_date(a['approved_at']))}")
+    elif status == ACCESS_PENDING:
+        lines.append(f"📨 Requested: {b(fmt_datetime(a.get('requested_at', 0)))}")
+        lines.append("<i>An admin will review your request soon.\nYou will get a message here once it is decided.</i>")
+    elif status == ACCESS_EXPIRED:
+        lines.append(f"📅 Expired: {b(fmt_date(a.get('expires', 0)))}")
+        lines.append("<i>Tap 🙋 Request Access to ask for a renewal.</i>")
+    elif status == ACCESS_REJECTED:
+        if a.get("reason"):
+            lines.append(f"💬 Reason: {esc(a['reason'])}")
+        wait = a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 - time.time()
+        if REJECT_COOLDOWN_H and wait > 0:
+            lines.append(f"<i>You can send a new request in {fmt_time(wait)}.</i>")
+        else:
+            lines.append("<i>You may send a new request now.</i>")
+    elif status == ACCESS_BANNED:
+        if a.get("reason"):
+            lines.append(f"💬 Reason: {esc(a['reason'])}")
+        lines.append("<i>Access to this bot has been blocked.</i>")
+    else:
+        lines.append("<i>This bot is private. Tap 🙋 Request Access\nand the owner will review your request.</i>")
+    lines.append(f"{DIV}\n<i>Your ID: {code(uid)}</i>")
+    return "\n".join(lines)
+
+def request_kb(status: str) -> Optional[InlineKeyboardMarkup]:
+    if status in (ACCESS_NONE, ACCESS_EXPIRED, ACCESS_REJECTED):
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Request Access", callback_data="req:send")]])
+    if status == ACCESS_PENDING:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check status", callback_data="req:status"),
+                                      InlineKeyboardButton("↩️ Withdraw", callback_data="req:cancel")]])
+    return None
+
+def approve_kb(uid: int, compact: bool = False) -> InlineKeyboardMarkup:
+    """Quick-approve buttons shown to admins next to a request / user card."""
+    rows = [[InlineKeyboardButton("1 Week", callback_data=f"ap:{uid}:1w"),
+             InlineKeyboardButton("1 Month", callback_data=f"ap:{uid}:1m"),
+             InlineKeyboardButton("3 Months", callback_data=f"ap:{uid}:3m")],
+            [InlineKeyboardButton("6 Months", callback_data=f"ap:{uid}:6m"),
+             InlineKeyboardButton("1 Year", callback_data=f"ap:{uid}:1y"),
+             InlineKeyboardButton("♾ Lifetime", callback_data=f"ap:{uid}:forever")],
+            [InlineKeyboardButton("✏️ Custom", callback_data=f"apc:{uid}"),
+             InlineKeyboardButton("❌ Reject", callback_data=f"rj:{uid}"),
+             InlineKeyboardButton("🚫 Ban", callback_data=f"bn:{uid}")]]
+    if not compact:
+        rows.append([InlineKeyboardButton("🔎 Profile", callback_data=f"ui:{uid}"),
+                     InlineKeyboardButton("⏳ All requests", callback_data="nav:pending")])
+    return InlineKeyboardMarkup(rows)
+
+def user_card_kb(uid: int) -> InlineKeyboardMarkup:
+    """Management buttons for an existing user (from /userinfo, /users)."""
+    status = store.status(uid)
+    rows = []
+    if status == ACCESS_BANNED:
+        rows.append([InlineKeyboardButton("♻️ Unban", callback_data=f"ub:{uid}")])
+    else:
+        if status == ACCESS_APPROVED:
+            rows.append([InlineKeyboardButton("+1 Week", callback_data=f"ex:{uid}:1w"),
+                         InlineKeyboardButton("+1 Month", callback_data=f"ex:{uid}:1m"),
+                         InlineKeyboardButton("+1 Year", callback_data=f"ex:{uid}:1y")])
+            rows.append([InlineKeyboardButton("♾ Lifetime", callback_data=f"ap:{uid}:forever"),
+                         InlineKeyboardButton("✏️ Custom", callback_data=f"apc:{uid}"),
+                         InlineKeyboardButton("🔒 Revoke", callback_data=f"rv:{uid}")])
+        else:
+            rows.append([InlineKeyboardButton("✅ 1 Month", callback_data=f"ap:{uid}:1m"),
+                         InlineKeyboardButton("✅ 1 Year", callback_data=f"ap:{uid}:1y"),
+                         InlineKeyboardButton("♾ Lifetime", callback_data=f"ap:{uid}:forever")])
+            rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"apc:{uid}"),
+                         InlineKeyboardButton("❌ Reject", callback_data=f"rj:{uid}")])
+        rows.append([InlineKeyboardButton("🚫 Ban", callback_data=f"bn:{uid}")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"ui:{uid}"),
+                 InlineKeyboardButton("👥 Users", callback_data="nav:users")])
+    return InlineKeyboardMarkup(rows)
+
+def text_user_card(uid: int) -> str:
+    u = store.user(uid)
+    if not u:
+        return header("User", "🔎") + f"{code(uid)} — <i>never talked to the bot.</i>"
+    a = store.access(uid)
+    status = store.status(uid)
+    label, icon = ACCESS_LABELS.get(status, ("Unknown", "❓"))
+    s = u.get("stats", {})
+    lines = [header("User Profile", "🔎"),
+             f"👤 {user_line(uid)}",
+             f"🎖 Role: {b(store.role(uid).title())}",
+             f"{icon} Access: {b(label)}"]
+    if status == ACCESS_APPROVED:
+        lines.append("⏳ Valid: " + b("♾ Lifetime" if store.is_owner(uid) or not a.get("expires")
+                                       else expiry_label(a["expires"])))
+        if a.get("plan"):
+            lines.append(f"📦 Plan: {b(plan_label(a['plan']))}")
+        if a.get("approved_by"):
+            lines.append(f"✅ By: {user_link(a['approved_by'])} · {fmt_date(a.get('approved_at', 0))}")
+    if a.get("note"):
+        lines.append(f"📝 Note: <i>{esc(a['note'])}</i>")
+    if a.get("reason") and status in (ACCESS_REJECTED, ACCESS_BANNED, ACCESS_NONE):
+        lines.append(f"💬 Reason: <i>{esc(a['reason'])}</i>")
+    lines += [f"📨 Requests: {b(a.get('requests', 0))}",
+              f"{DIV}",
+              f"📚 Jobs: {b(s.get('jobs', 0))} · 🧩 Parts: {b(s.get('parts', 0))} · 🔤 {b(fmt_int(s.get('chars', 0)))}",
+              f"📅 Joined: {b(fmt_date(u.get('joined', 0)))} · 👀 Seen: {b(fmt_date(u.get('last_seen', 0)))}"]
+    hist = a.get("history") or []
+    if hist:
+        lines.append(f"{DIV}\n{b('Recent')}")
+        for h in hist[-5:][::-1]:
+            extra = ""
+            if h.get("expires"):
+                extra = f" → {fmt_date(h['expires'])}"
+            elif h.get("action") in ("approve", "extend"):
+                extra = " → ♾"
+            lines.append(f"• {fmt_date(h.get('ts', 0))} · {esc(h.get('action', ''))}{extra}")
+    return "\n".join(lines)
+
+async def notify_admins(text: str, kb: Optional[InlineKeyboardMarkup] = None, exclude: int = 0) -> None:
+    for aid in store.admins():
+        if aid and aid != exclude:
+            await safe_send(aid, text, reply_markup=kb)
+
+async def send_access_request(uid: int, name: str, username: str = "", note: str = "") -> Tuple[bool, str]:
+    """Create the request and ping every admin with quick-approve buttons."""
+    ok, why = store.request_access(uid, name, username, note)
+    if not ok:
+        return ok, why
+    a = store.access(uid)
+    text = (header("Access Request", "🙋") +
+            f"👤 {user_line(uid)}\n"
+            f"📨 Request #{a.get('requests', 1)} · {fmt_datetime(a.get('requested_at', 0))}\n"
+            + (f"📝 <i>{esc(note)}</i>\n" if note else "")
+            + f"⏳ Waiting: {b(len(store.pending_users()))}\n"
+            f"{DIV}\nChoose a plan to approve:")
+    await notify_admins(text, approve_kb(uid))
+    return True, "ok"
+
+async def grant_and_notify(uid: int, spec: str, by: int, extend: bool = False) -> Optional[dict]:
+    """Approve/extend + tell the user + refresh their command menu."""
+    a = store.approve(uid, spec, by, extend=extend)
+    if a is None:
+        return None
+    await set_user_commands(uid, force=True)
+    what = "Access Extended" if extend else "Access Granted"
+    await safe_send(uid, header(what, "✅") +
+                    f"🎉 Welcome{'' if extend else ' aboard'}!\n"
+                    f"📦 Plan: {b(plan_label(a.get('plan', spec)))}\n"
+                    f"⏳ Valid: {b('♾ Lifetime' if not a.get('expires') else expiry_label(a['expires']))}\n\n"
+                    "Send /start to open the menu or just drop a document.",
+                    reply_markup=reply_keyboard(uid))
+    return a
+
+async def _access_denied_reply(m: Message) -> None:
+    """Shown to anyone who is not approved — with the right call-to-action."""
+    uid = m.from_user.id
+    status = store.status(uid)
+    if status == ACCESS_BANNED:
+        return  # stay silent for banned users (avoid spam loops)
+    await m.reply(text_access(uid), reply_markup=locked_keyboard(status))
+    kb = request_kb(status)
+    if kb:
+        hint = {"pending": "⏳ Your request is in the queue.",
+                "expired": "⌛ Your plan has ended — request a renewal.",
+                "rejected": "❌ Your last request was declined."}.get(status, "🔒 This bot is private.")
+        await m.reply(hint, reply_markup=kb)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔒 NOT APPROVED  (visitors · pending · expired · rejected · banned)
+# ═══════════════════════════════════════════════════════════════════════════
+async def do_request(m: Message, note: str = "") -> None:
+    uid = m.from_user.id
+    ok, why = await send_access_request(uid, m.from_user.first_name or "User", m.from_user.username or "", note)
+    if ok:
+        await m.reply(header("Request Sent", "📨") +
+                      "Your access request has been sent to the owner.\n"
+                      "You will be notified here as soon as it is approved.\n\n"
+                      f"<i>Your ID: {code(uid)}</i>",
+                      reply_markup=locked_keyboard(ACCESS_PENDING))
+        await m.reply("⏳ Status: <b>Pending approval</b>", reply_markup=request_kb(ACCESS_PENDING))
+    elif why == "pending":
+        await m.reply("⏳ Your request is already pending — please wait for an admin.",
+                      reply_markup=request_kb(ACCESS_PENDING))
+    elif why == "approved":
+        await m.reply("✅ You already have access! Send /start.", reply_markup=reply_keyboard(uid))
+    elif why == "cooldown":
+        a = store.access(uid)
+        wait = a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 - time.time()
+        await m.reply(f"⏱ Your last request was declined. You can try again in {b(fmt_time(wait))}.")
+    # banned → silent
+
+@app.on_message(filters.command(["request", "start"]) & PRIVATE & ~authorized)
+async def locked_start(_, m: Message):
+    if not m.from_user:
+        return
+    touch_user(m)
+    uid = m.from_user.id
+    if store.is_banned(uid):
+        return
+    if m.command[0].lower() == "request":
+        note = m.text.split(None, 1)[1].strip() if len(m.command) > 1 else ""
+        return await do_request(m, note)
+    status = store.status(uid)
+    await m.reply(header(BOT_NAME) +
+                  f"👋 Hello, {b(m.from_user.first_name or 'there')}!\n\n"
+                  "I translate <b>EPUB / TXT / DOCX</b> books into your language.\n"
+                  "This bot is <b>private</b> — access is granted by the owner.\n\n"
+                  + {"pending": "⏳ Your request is <b>pending</b>. Hang tight!",
+                     "expired": "⌛ Your plan has <b>expired</b>. Request a renewal below.",
+                     "rejected": "❌ Your last request was <b>declined</b>."}.get(
+                        status, "Tap 🙋 <b>Request Access</b> and I will notify the owner.")
+                  + f"\n\n<i>Your ID: {code(uid)}</i>",
+                  reply_markup=locked_keyboard(status))
+    kb = request_kb(status)
+    if kb:
+        await m.reply("👇", reply_markup=kb)
+
+@app.on_message(filters.command("access") & PRIVATE)
+async def cmd_access(_, m: Message):
+    if not m.from_user:
+        return
+    touch_user(m)
+    uid = m.from_user.id
+    if store.is_banned(uid) and not store.is_authorized(uid):
+        return
+    kb = request_kb(store.status(uid)) if not store.is_authorized(uid) else back_home_kb()
+    await m.reply(text_access(uid), reply_markup=kb)
+
 @app.on_message(PRIVATE & ~authorized)
 async def unauthorized_message(_, m: Message):
     if not m.from_user:
         return
-    if m.text and store.security_code and m.text.strip() == store.security_code:
-        store.authorize(m.from_user.id, m.from_user.first_name or "User")
-        role = "👑 Owner" if store.is_owner(m.from_user.id) else "👤 User"
-        try:
-            await m.delete()               # don't leave the code in chat history
-        except Exception:
-            pass
-        await set_user_commands(m.from_user.id, force=True)
-        await m.reply(header("Access Granted", "✅") +
-                      f"Welcome, {b(m.from_user.first_name)}!\nRole: {b(role)}\n\n"
-                      "Use the menu below or send /start to begin.",
-                      reply_markup=reply_keyboard(m.from_user.id))
+    touch_user(m)
+    uid = m.from_user.id
+    if store.is_banned(uid):
         return
-    if m.text and m.text.strip() == BTN_MYID:
-        return await m.reply(f"🆔 Your Telegram ID: {code(m.from_user.id)}")
-    await m.reply(header("Security Locked", "🔒") +
-                  "This bot is private.\nSend the <b>security code</b> to unlock.\n\n"
-                  f"<i>Your ID: {code(m.from_user.id)}</i>",
-                  reply_markup=locked_keyboard())
+    txt = (m.text or "").strip()
+    if txt == BTN_MYID or txt.startswith("/id"):
+        return await m.reply(f"🆔 Your Telegram ID: {code(uid)}")
+    if txt == BTN_REQUEST:
+        return await do_request(m)
+    if txt == BTN_MYACCESS:
+        return await cmd_access(_, m)
+    # pending users may attach a short note to their request by simply typing
+    a = store.access(uid)
+    if a["status"] == ACCESS_PENDING and txt and not txt.startswith("/") and len(txt) <= 200:
+        a["note"] = txt
+        store._save_user(uid)
+        return await m.reply("📝 Noted — your message was attached to the request.")
+    await _access_denied_reply(m)
+
+@app.on_callback_query(filters.regex(r"^req:") & ~authorized_cb)
+async def request_callbacks(_, q: CallbackQuery):
+    uid = q.from_user.id
+    store.ensure_user(uid, q.from_user.first_name or "User", q.from_user.username or "")
+    if store.is_banned(uid):
+        return await _answer(q, "🚫 Access blocked.", alert=True)
+    action = (q.data or "").split(":", 1)[1]
+    if action == "send":
+        ok, why = await send_access_request(uid, q.from_user.first_name or "User", q.from_user.username or "")
+        if ok:
+            await _edit(q, header("Request Sent", "📨") + "The owner has been notified.\n"
+                        "You will receive a message here once it is approved.", request_kb(ACCESS_PENDING))
+            try:
+                await q.message.reply("⏳ Waiting for approval…", reply_markup=locked_keyboard(ACCESS_PENDING))
+            except Exception:
+                pass
+            return await _answer(q, "📨 Request sent")
+        if why == "pending":
+            await _edit(q, text_access(uid), request_kb(ACCESS_PENDING))
+            return await _answer(q, "Already pending")
+        if why == "cooldown":
+            a = store.access(uid)
+            wait = a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 - time.time()
+            return await _answer(q, f"⏱ Try again in {fmt_time(wait)}", alert=True)
+        return await _answer(q)
+    if action == "status":
+        await _edit(q, text_access(uid), request_kb(store.status(uid)))
+        return await _answer(q, "🔄 Updated")
+    if action == "cancel":
+        a = store.access(uid)
+        if a["status"] == ACCESS_PENDING:
+            a.update({"status": ACCESS_NONE, "updated": int(time.time())})
+            store._save_user(uid)
+            store.audit("withdraw", uid, uid)
+        await _edit(q, text_access(uid), request_kb(store.status(uid)))
+        return await _answer(q, "Request withdrawn")
+    await _answer(q)
 
 @app.on_callback_query(~authorized_cb)
 async def unauthorized_callback(_, q: CallbackQuery):
-    await q.answer("🔒 Not authorized. Send the security code first.", show_alert=True)
+    await q.answer("🔒 Not approved yet. Use 🙋 Request Access first.", show_alert=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1873,8 +2627,9 @@ def text_mystats(uid: int) -> str:
     return (
         header("My Statistics", "📊") +
         f"👤 {b(u.get('name', 'User'))}  ·  {code(uid)}\n"
-        f"🎖 Role: {b(u.get('role', 'user').title())}\n"
-        f"📅 Since restart: {b(since)}\n"
+        f"🎖 Role: {b(store.role(uid).title())}\n"
+        f"🎫 Access: {b(access_line(uid))}\n"
+        f"📅 Joined: {b(since)}\n"
         f"{DIV}\n"
         f"📚 Files translated: {b(s.get('jobs', 0))}\n"
         f"🧩 Parts delivered: {b(s.get('parts', 0))}\n"
@@ -1891,14 +2646,17 @@ async def cmd_mystats(_, m: Message):
 async def cmd_id(_, m: Message):
     await m.reply(f"🆔 Your Telegram ID: {code(m.from_user.id)}")
 
-# ── Owner commands ──────────────────────────────────────────────────────────
+# ── Owner / admin commands ──────────────────────────────────────────────────
 def text_owner() -> str:
     s = store.stats
     up = fmt_time(time.time() - store.booted)
+    c = store.count_by_status()
     return (
         header("Owner Panel", "👑") +
         f"⏱ Uptime: {b(up)}\n"
-        f"👥 Users: {b(len(store.users))}  ·  🔓 Public: {b('yes' if PUBLIC_MODE else 'no')}\n"
+        f"👥 Users: {b(len(store.users))}  ·  ✅ Approved: {b(c.get(ACCESS_APPROVED, 0))}  ·  ⏳ Pending: {b(c.get(ACCESS_PENDING, 0))}\n"
+        f"⌛ Expired: {b(c.get(ACCESS_EXPIRED, 0))}  ·  ❌ Rejected: {b(c.get(ACCESS_REJECTED, 0))}  ·  🚫 Banned: {b(c.get(ACCESS_BANNED, 0))}\n"
+        f"🛡 Admins: {b(len(store.admins()) - (1 if store.owner_id else 0))}  ·  🔓 Public: {b('yes' if PUBLIC_MODE else 'no')}\n"
         f"💬 Tracked chats: {b(len(store.chats))}\n"
         f"📚 Jobs done: {b(s['jobs'])}  ·  ❌ Failed: {b(s['failed'])}  ·  🛑 Cancelled: {b(s['cancelled'])}\n"
         f"🧩 Parts: {b(s['parts'])}  ·  🔤 Chars: {b(fmt_int(s['chars']))}\n"
@@ -1906,78 +2664,253 @@ def text_owner() -> str:
         f"⏳ Queue: {b(len(QUEUE))}  ·  📝 Pending wizards: {b(len(PENDING))}\n"
         f"🗄 Backup group: {b(BACKUP_GROUP_ID or 'disabled')}\n"
         f"{DIV}\n"
-        f"{b('Commands')}\n"
-        "/users – list users\n"
-        "/adduser &lt;id&gt; · /deluser &lt;id&gt;\n"
-        "/broadcast &lt;text&gt; (or reply)\n"
-        "/setcode &lt;new code&gt;\n"
-        "/links – admin invite links\n"
-        "/stats – this panel\n"
+        f"{b('Access')}\n"
+        "/pending – requests waiting\n"
+        "/approve &lt;id&gt; [1w|1m|1y|forever|45d|2026-12-31]\n"
+        "/extend &lt;id&gt; &lt;duration&gt; · /revoke &lt;id&gt;\n"
+        "/reject &lt;id&gt; [reason] · /ban &lt;id&gt; [reason] · /unban &lt;id&gt;\n"
+        "/users · /userinfo &lt;id&gt; · /audit\n"
+        f"{b('Owner')}\n"
+        "/admins · /addadmin &lt;id&gt; · /deladmin &lt;id&gt;\n"
+        "/broadcast &lt;text&gt; (or reply) · /links\n"
         f"{DIV}\n"
-        + (f"<i>🗄 MongoDB connected ({esc(MONGO_DB)}) — users, settings\nand history are persistent.</i>\n"
+        + (f"<i>🗄 MongoDB connected ({esc(MONGO_DB)}) — users, access\nand history are persistent.</i>\n"
            f"<i>💾 Storage: {store.db_size_mb:.1f} / {DB_BUDGET_MB} MB ({store.budget_info()['percent']}%)"
            f" · {fmt_int(store.db_job_docs)} job docs · TTL {DB_JOB_TTL_DAYS} d</i>"
            if store.connected else
-           "<i>⚠️ No database: users added at runtime are lost on\n"
-           "restart. Put permanent IDs in AUTHORIZED_USERS env.</i>")
+           "<i>⚠️ No database: approvals given at runtime are lost on\n"
+           "restart. Put permanent IDs in AUTHORIZED_USERS / ADMIN_USERS env.</i>")
     )
 
 @app.on_message(filters.command("stats") & PRIVATE & owner_only)
 async def cmd_stats(_, m: Message):
     await m.reply(text_owner(), reply_markup=back_home_kb())
 
-@app.on_message(filters.command("users") & PRIVATE & owner_only)
-async def cmd_users(_, m: Message):
-    users = store.users
-    lines = [header(f"Users ({len(users)})", "👥")]
-    for uid, u in list(users.items())[:60]:
-        crown = "👑 " if u.get("role") == "owner" else ""
-        lines.append(f"{crown}{esc(u.get('name', 'User'))} — {code(uid)} · {u['stats'].get('jobs', 0)} jobs")
-    if len(users) > 60:
-        lines.append(f"… and {len(users) - 60} more")
-    if not users:
+def _parse_target(m: Message, usage: str) -> Optional[int]:
+    """`/cmd <id>` or `/cmd` as a reply to a forwarded message → user id."""
+    if len(m.command) > 1 and m.command[1].lstrip("-").isdigit():
+        return int(m.command[1])
+    if m.reply_to_message and m.reply_to_message.forward_from:
+        return m.reply_to_message.forward_from.id
+    return None
+
+def text_pending() -> str:
+    rows = store.pending_users()
+    lines = [header(f"Access Requests ({len(rows)})", "⏳")]
+    if not rows:
+        lines.append("<i>No pending requests. 🎉</i>")
+    for uid, u in rows[:25]:
+        a = u["access"]
+        note = f"\n   📝 <i>{esc(a['note'][:80])}</i>" if a.get("note") else ""
+        lines.append(f"• {user_line(uid)}\n   📨 {fmt_datetime(a.get('requested_at', 0))} · #{a.get('requests', 1)}{note}")
+    if len(rows) > 25:
+        lines.append(f"… and {len(rows) - 25} more")
+    return "\n".join(lines)
+
+def pending_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for uid, u in store.pending_users()[:8]:
+        name = (u.get("name") or "User")[:18]
+        rows.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"ui:{uid}"),
+                     InlineKeyboardButton("1 M", callback_data=f"ap:{uid}:1m"),
+                     InlineKeyboardButton("1 Y", callback_data=f"ap:{uid}:1y"),
+                     InlineKeyboardButton("♾", callback_data=f"ap:{uid}:forever"),
+                     InlineKeyboardButton("❌", callback_data=f"rj:{uid}")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="nav:pending"),
+                 InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
+
+@app.on_message(filters.command("pending") & PRIVATE & admin_only)
+async def cmd_pending(_, m: Message):
+    await m.reply(text_pending(), reply_markup=pending_kb(), disable_web_page_preview=True)
+
+def text_users(page: int = 0, per_page: int = 30) -> str:
+    users = sorted(store.users.items(), key=lambda kv: (
+        {ACCESS_PENDING: 0, ACCESS_APPROVED: 1, ACCESS_EXPIRED: 2, ACCESS_NONE: 3,
+         ACCESS_REJECTED: 4, ACCESS_BANNED: 5}.get(store.status(kv[0]), 9),
+        -kv[1].get("last_seen", 0)))
+    total = len(users)
+    chunk = users[page * per_page:(page + 1) * per_page]
+    c = store.count_by_status()
+    lines = [header(f"Users ({total})", "👥"),
+             f"✅ {c.get(ACCESS_APPROVED, 0)} · ⏳ {c.get(ACCESS_PENDING, 0)} · ⌛ {c.get(ACCESS_EXPIRED, 0)} · "
+             f"🔒 {c.get(ACCESS_NONE, 0)} · ❌ {c.get(ACCESS_REJECTED, 0)} · 🚫 {c.get(ACCESS_BANNED, 0)}\n{DIV}"]
+    for uid, u in chunk:
+        st = store.status(uid)
+        icon = "👑" if store.is_owner(uid) else "🛡" if u.get("role") == "admin" else ACCESS_LABELS.get(st, ("", "❓"))[1]
+        a = u.get("access", {})
+        tail = ""
+        if st == ACCESS_APPROVED and not store.is_owner(uid):
+            tail = " · ♾" if not a.get("expires") else f" · ⏳ {days_left(a['expires'])} d"
+        lines.append(f"{icon} {esc(u.get('name', 'User'))} — {code(uid)} · {u.get('stats', {}).get('jobs', 0)} jobs{tail}")
+    if not chunk:
         lines.append("<i>No users yet.</i>")
-    await m.reply("\n".join(lines))
+    if total > per_page:
+        lines.append(f"\n<i>Page {page + 1} / {(total + per_page - 1) // per_page}</i>")
+    lines.append("\n<i>/userinfo &lt;id&gt; opens a profile with action buttons.</i>")
+    return "\n".join(lines)
 
-@app.on_message(filters.command("adduser") & PRIVATE & owner_only)
-async def cmd_adduser(_, m: Message):
-    if len(m.command) < 2 or not m.command[1].lstrip("-").isdigit():
-        return await m.reply("Usage: <code>/adduser 123456789</code>")
-    uid = int(m.command[1])
-    store.authorize(uid, "Added by owner")
-    await set_user_commands(uid, force=True)
-    await m.reply(f"✅ User {code(uid)} authorized." +
-                  ("" if store.connected else "\n<i>Add to AUTHORIZED_USERS env to keep after restarts.</i>"))
-    await safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.",
-                    reply_markup=reply_keyboard(uid))
+def users_kb(page: int = 0, per_page: int = 30) -> InlineKeyboardMarkup:
+    total = len(store.users)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"nav:users:{page - 1}"))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"nav:users:{page + 1}"))
+    rows = [nav] if nav else []
+    rows.append([InlineKeyboardButton("⏳ Requests", callback_data="nav:pending"),
+                 InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
 
-@app.on_message(filters.command("deluser") & PRIVATE & owner_only)
-async def cmd_deluser(_, m: Message):
-    if len(m.command) < 2 or not m.command[1].lstrip("-").isdigit():
-        return await m.reply("Usage: <code>/deluser 123456789</code>")
-    uid = int(m.command[1])
-    ok = store.revoke(uid)
-    if ok:
+@app.on_message(filters.command("users") & PRIVATE & admin_only)
+async def cmd_users(_, m: Message):
+    await m.reply(text_users(), reply_markup=users_kb())
+
+@app.on_message(filters.command("userinfo") & PRIVATE & admin_only)
+async def cmd_userinfo(_, m: Message):
+    uid = _parse_target(m, "userinfo")
+    if not uid:
+        return await m.reply("Usage: <code>/userinfo 123456789</code>")
+    await m.reply(text_user_card(uid), reply_markup=user_card_kb(uid), disable_web_page_preview=True)
+
+@app.on_message(filters.command(["approve", "adduser", "extend"]) & PRIVATE & admin_only)
+async def cmd_approve(_, m: Message):
+    cmd = m.command[0].lower()
+    extend = cmd == "extend"
+    uid = _parse_target(m, cmd)
+    if not uid:
+        return await m.reply(f"Usage: <code>/{cmd} 123456789 1m</code>\n"
+                             "Durations: <code>1w</code> · <code>1m</code> · <code>3m</code> · <code>1y</code> · "
+                             "<code>forever</code> · <code>45d</code> · <code>12h</code> · <code>2026-12-31</code>")
+    spec = m.command[2] if len(m.command) > 2 else ("" if extend else DEFAULT_APPROVAL)
+    if not spec:
+        return await m.reply("Usage: <code>/extend 123456789 1m</code>")
+    if parse_duration(spec) is None:
+        return await m.reply(f"⚠️ I don't understand the duration {code(spec)}.\n"
+                             "Try <code>1w</code>, <code>1m</code>, <code>1y</code>, <code>forever</code>, "
+                             "<code>45d</code> or a date like <code>2026-12-31</code>.")
+    if store.is_banned(uid):
+        return await m.reply("🚫 This user is banned — /unban first.")
+    a = await grant_and_notify(uid, spec, m.from_user.id, extend=extend)
+    if a is None:
+        return await m.reply("⚠️ Could not approve this user.")
+    await m.reply((f"✅ {user_line(uid)} " + ("extended" if extend else "approved") + ".\n"
+                   f"📦 Plan: {b(plan_label(a.get('plan', spec)))} · ⏳ "
+                   f"{b('♾ Lifetime' if not a.get('expires') else expiry_label(a['expires']))}")
+                  + ("" if store.connected else "\n<i>No database — add to AUTHORIZED_USERS env to keep after restarts.</i>"),
+                  disable_web_page_preview=True)
+    if not extend:
+        await notify_admins(f"✅ {user_link(m.from_user.id, m.from_user.first_name)} approved {user_line(uid)} "
+                            f"({plan_label(a.get('plan', spec))}).", exclude=m.from_user.id)
+
+@app.on_message(filters.command(["reject", "revoke", "deluser", "ban", "unban"]) & PRIVATE & admin_only)
+async def cmd_moderate(_, m: Message):
+    cmd = m.command[0].lower()
+    uid = _parse_target(m, cmd)
+    if not uid:
+        return await m.reply(f"Usage: <code>/{cmd} 123456789 [reason]</code>")
+    if store.is_owner(uid):
+        return await m.reply("👑 You cannot moderate the owner.")
+    if store.role(uid) == "admin" and not store.is_owner(m.from_user.id):
+        return await m.reply("🛡 Only the owner can moderate another admin.")
+    reason = " ".join(m.command[2:]).strip() if len(m.command) > 2 else ""
+    by = m.from_user.id
+    if cmd == "reject":
+        if not store.reject(uid, by, reason):
+            return await m.reply("⚠️ Unknown user.")
+        await m.reply(f"❌ Request of {user_line(uid)} rejected.", disable_web_page_preview=True)
+        await safe_send(uid, header("Request Declined", "❌") +
+                        (f"💬 {esc(reason)}\n\n" if reason else "") +
+                        (f"<i>You may send a new request after {REJECT_COOLDOWN_H} h.</i>" if REJECT_COOLDOWN_H
+                         else "<i>You may send a new request anytime.</i>"),
+                        reply_markup=locked_keyboard(ACCESS_REJECTED))
+    elif cmd in ("revoke", "deluser"):
+        if not store.revoke(uid, by, reason):
+            return await m.reply("⚠️ User has no access to revoke.")
         await clear_user_commands(uid)
-        await safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed.",
-                        reply_markup=ReplyKeyboardRemove())
-    await m.reply(f"🗑 User {code(uid)} removed." if ok else "⚠️ Not found (or is the owner).")
+        await m.reply(f"🔒 Access of {user_line(uid)} revoked.", disable_web_page_preview=True)
+        await safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed." +
+                        (f"\n💬 {esc(reason)}" if reason else "") +
+                        "\n\n<i>You may request access again.</i>",
+                        reply_markup=locked_keyboard(ACCESS_NONE))
+    elif cmd == "ban":
+        store.ban(uid, by, reason)
+        await clear_user_commands(uid)
+        # drop their running / queued jobs
+        for j in [j for j in QUEUE if j.user_id == uid]:
+            QUEUE.remove(j); j.status = "cancelled"; j.cleanup()
+        if ACTIVE and ACTIVE.user_id == uid:
+            ACTIVE.cancel.set()
+        for jid, j in [(k, v) for k, v in PENDING.items() if v.user_id == uid]:
+            PENDING.pop(jid, None); j.cleanup()
+        await m.reply(f"🚫 {user_line(uid)} banned.", disable_web_page_preview=True)
+        await safe_send(uid, header("Access Blocked", "🚫") + "You have been blocked from using this bot." +
+                        (f"\n💬 {esc(reason)}" if reason else ""), reply_markup=ReplyKeyboardRemove())
+    elif cmd == "unban":
+        if not store.unban(uid, by):
+            return await m.reply("⚠️ This user is not banned.")
+        await m.reply(f"♻️ {user_line(uid)} unbanned — they may request access again.", disable_web_page_preview=True)
+        await safe_send(uid, header("Unblocked", "♻️") + "You may request access again.",
+                        reply_markup=locked_keyboard(ACCESS_NONE))
 
-@app.on_message(filters.command("setcode") & PRIVATE & owner_only)
-async def cmd_setcode(_, m: Message):
-    if len(m.command) < 2:
-        return await m.reply("Usage: <code>/setcode NewSecret123</code>")
-    new_code = m.text.split(None, 1)[1].strip()
-    if len(new_code) < 6:
-        return await m.reply("⚠️ Code must be at least 6 characters.")
-    store.set_security_code(new_code)
-    try:
-        await m.delete()
-    except Exception:
-        pass
-    await m.reply("🔐 Security code updated.\n" +
-                  ("<i>Saved to MongoDB — it survives restarts unless SECURITY_CODE env overrides it.</i>"
-                   if store.connected else "<i>Set SECURITY_CODE env to make it permanent.</i>"))
+@app.on_message(filters.command(["admins", "addadmin", "deladmin"]) & PRIVATE & owner_only)
+async def cmd_admins(_, m: Message):
+    cmd = m.command[0].lower()
+    if cmd == "admins":
+        ids = [a for a in store.admins() if not store.is_owner(a)]
+        lines = [header(f"Admins ({len(ids)})", "🛡"), f"👑 {user_line(store.owner_id)} — owner"]
+        lines += [f"🛡 {user_line(a)}" for a in ids]
+        if ADMIN_USERS:
+            lines.append(f"\n<i>From env ADMIN_USERS: {', '.join(map(str, ADMIN_USERS))}</i>")
+        lines.append("\n/addadmin &lt;id&gt; · /deladmin &lt;id&gt;\n<i>Admins can approve, extend, reject and ban users.</i>")
+        return await m.reply("\n".join(lines), disable_web_page_preview=True)
+    uid = _parse_target(m, cmd)
+    if not uid:
+        return await m.reply(f"Usage: <code>/{cmd} 123456789</code>")
+    if cmd == "addadmin":
+        if not store.set_admin(uid, True, m.from_user.id):
+            return await m.reply("⚠️ Already an admin (or the owner).")
+        await set_user_commands(uid, force=True)
+        await m.reply(f"🛡 {user_line(uid)} is now an admin (lifetime access).", disable_web_page_preview=True)
+        await safe_send(uid, header("You are an Admin", "🛡") +
+                        "You can now approve access requests.\nSend /start to refresh your menu.",
+                        reply_markup=reply_keyboard(uid))
+    else:
+        if uid in ADMIN_USERS:
+            return await m.reply("⚠️ This admin is configured in ADMIN_USERS env — remove it there first.")
+        if not store.set_admin(uid, False, m.from_user.id):
+            return await m.reply("⚠️ Not an admin.")
+        await set_user_commands(uid, force=True)
+        await m.reply(f"👤 {user_line(uid)} is no longer an admin (keeps user access).", disable_web_page_preview=True)
+        await safe_send(uid, "ℹ️ You are no longer an admin. Send /start to refresh your menu.",
+                        reply_markup=reply_keyboard(uid))
+
+AUDIT_ICONS = {"request": "🙋", "approve": "✅", "extend": "➕", "reject": "❌", "revoke": "🔒", "ban": "🚫",
+               "unban": "♻️", "expired": "⌛", "promote": "🛡", "demote": "👤", "withdraw": "↩️", "reminder": "🔔"}
+
+def text_audit(limit: int = 30) -> str:
+    rows = store.recent_audit(limit)
+    lines = [header("Audit Log", "📜")]
+    if not rows:
+        lines.append("<i>Nothing yet.</i>")
+    for e in rows:
+        icon = AUDIT_ICONS.get(e.get("action"), "•")
+        actor = "system" if not e.get("actor") else esc(e.get("actor_name") or e["actor"])
+        target = esc(e.get("target_name") or e.get("target", ""))
+        extra = ""
+        if e.get("plan"):
+            extra = f" · {esc(plan_label(e['plan']))}"
+        if e.get("reason"):
+            extra += f" · <i>{esc(e['reason'])}</i>"
+        lines.append(f"{icon} {time.strftime('%d %b %H:%M', time.localtime(e.get('ts', 0)))} · "
+                     f"{esc(e.get('action', ''))} · {target} <i>by {actor}</i>{extra}")
+    return "\n".join(lines)
+
+@app.on_message(filters.command("audit") & PRIVATE & owner_only)
+async def cmd_audit(_, m: Message):
+    await m.reply(text_audit(), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Refresh", callback_data="nav:audit"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home")]]))
 
 @app.on_message(filters.command("broadcast") & PRIVATE & owner_only)
 async def cmd_broadcast(_, m: Message):
@@ -1988,7 +2921,7 @@ async def cmd_broadcast(_, m: Message):
                              "or reply to any message with <code>/broadcast</code>.")
     sent = failed = 0
     status = await m.reply("📣 Broadcasting…")
-    for uid in list(store.users.keys()):
+    for uid in store.approved_users():
         for _attempt in range(2):
             try:
                 if src:
@@ -2183,12 +3116,97 @@ async def callbacks(_, q: CallbackQuery):
     kind = parts[0]
     arg1 = parts[1] if len(parts) > 1 else ""
     arg2 = parts[2] if len(parts) > 2 else ""
-    if PUBLIC_MODE:
-        store.ensure_user(uid, q.from_user.first_name or "User")
+    store.ensure_user(uid, q.from_user.first_name or "User", q.from_user.username or "")
+
+    # ── Admin: approval actions on request / user cards ─────────────────────────
+    if kind in ("ap", "apc", "rj", "bn", "ub", "rv", "ex", "ui"):
+        if not store.is_admin(uid):
+            return await _answer(q, "🛡 Admins only.", alert=True)
+        if not arg1.lstrip("-").isdigit():
+            return await _answer(q)
+        target = int(arg1)
+        if store.is_owner(target) and kind != "ui":
+            return await _answer(q, "👑 The owner cannot be modified.", alert=True)
+        if store.role(target) == "admin" and not store.is_owner(uid) and kind in ("rj", "bn", "rv"):
+            return await _answer(q, "🛡 Only the owner can moderate an admin.", alert=True)
+        if kind == "ui":
+            await _edit(q, text_user_card(target), user_card_kb(target))
+            return await _answer(q)
+        if kind in ("ap", "ex"):
+            if store.is_banned(target):
+                return await _answer(q, "🚫 User is banned — unban first.", alert=True)
+            a = await grant_and_notify(target, arg2, uid, extend=(kind == "ex"))
+            if a is None:
+                return await _answer(q, "⚠️ Could not approve.", alert=True)
+            verb = "extended" if kind == "ex" else "approved"
+            await _edit(q, header("Approved" if kind == "ap" else "Extended", "✅") +
+                        f"👤 {user_line(target)}\n📦 Plan: {b(plan_label(a.get('plan', arg2)))}\n"
+                        f"⏳ {b('♾ Lifetime' if not a.get('expires') else expiry_label(a['expires']))}\n"
+                        f"<i>by {esc(q.from_user.first_name or 'admin')}</i>", user_card_kb(target))
+            await notify_admins(f"✅ {user_link(uid, q.from_user.first_name)} {verb} {user_line(target)} "
+                                f"({plan_label(a.get('plan', arg2))}).", exclude=uid)
+            return await _answer(q, f"✅ {verb.title()}")
+        if kind == "apc":
+            USER_STATE[chat_id] = {"state": "await_duration", "target": target}
+            await _edit(q, header("Custom duration", "✏️") + f"👤 {user_line(target)}\n\n"
+                        "Type the access duration, e.g.\n"
+                        "<code>45d</code> · <code>2w</code> · <code>3m</code> · <code>2y</code> · <code>12h</code> · "
+                        "<code>forever</code> · <code>2026-12-31</code>",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data=f"ui:{target}")]]))
+            return await _answer(q)
+        if kind == "rj":
+            USER_STATE[chat_id] = {"state": "await_reason", "target": target, "action": "reject"}
+            await _edit(q, header("Reject request", "❌") + f"👤 {user_line(target)}\n\n"
+                        "Type a short reason for the user, or tap <b>Skip</b>.",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip reason", callback_data=f"rjx:{target}"),
+                                               InlineKeyboardButton("◀️ Back", callback_data=f"ui:{target}")]]))
+            return await _answer(q)
+        if kind == "bn":
+            USER_STATE[chat_id] = {"state": "await_reason", "target": target, "action": "ban"}
+            await _edit(q, header("Ban user", "🚫") + f"👤 {user_line(target)}\n\n"
+                        "Type a reason, or tap <b>Ban now</b>.",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban now", callback_data=f"bnx:{target}"),
+                                               InlineKeyboardButton("◀️ Back", callback_data=f"ui:{target}")]]))
+            return await _answer(q)
+        if kind == "ub":
+            ok = store.unban(target, uid)
+            if ok:
+                await safe_send(target, header("Unblocked", "♻️") + "You may request access again.",
+                                reply_markup=locked_keyboard(ACCESS_NONE))
+            await _edit(q, text_user_card(target), user_card_kb(target))
+            return await _answer(q, "♻️ Unbanned" if ok else "Not banned")
+        if kind == "rv":
+            ok = store.revoke(target, uid)
+            if ok:
+                await clear_user_commands(target)
+                await safe_send(target, header("Access Revoked", "🔒") + "Your access has been removed.\n\n"
+                                "<i>You may request access again.</i>", reply_markup=locked_keyboard(ACCESS_NONE))
+            await _edit(q, text_user_card(target), user_card_kb(target))
+            return await _answer(q, "🔒 Revoked" if ok else "Nothing to revoke")
+
+    if kind in ("rjx", "bnx"):                    # reject / ban without a reason
+        if not store.is_admin(uid) or not arg1.lstrip("-").isdigit():
+            return await _answer(q, "🛡 Admins only.", alert=True)
+        USER_STATE.pop(chat_id, None)
+        await finish_moderation(int(arg1), uid, "reject" if kind == "rjx" else "ban", "", q=q)
+        return await _answer(q)
 
     if kind == "nav":
         USER_STATE.pop(chat_id, None)
-        if arg1 == "home":
+        if arg1 in ("pending", "users", "audit") and not store.is_admin(uid):
+            return await _answer(q, "🛡 Admins only.", alert=True)
+        if arg1 == "pending":
+            await _edit(q, text_pending(), pending_kb())
+        elif arg1 == "users":
+            page = int(arg2) if arg2.isdigit() else 0
+            await _edit(q, text_users(page), users_kb(page))
+        elif arg1 == "audit" and store.is_owner(uid):
+            await _edit(q, text_audit(), InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Refresh", callback_data="nav:audit"),
+                InlineKeyboardButton("🏠 Home", callback_data="nav:home")]]))
+        elif arg1 == "access":
+            await _edit(q, text_access(uid), back_home_kb())
+        elif arg1 == "home":
             await _edit(q, text_home(uid, q.from_user.first_name or "there"), home_keyboard(uid))
         elif arg1 == "help":
             await _edit(q, text_help(), back_home_kb())
@@ -2309,6 +3327,42 @@ def parse_size_kb(text: str) -> Optional[int]:
     unit = mt.group(2) or "kb"
     return int(val * 1024) if unit.startswith("m") else int(val)
 
+async def finish_moderation(target: int, by: int, action: str, reason: str,
+                            q: Optional[CallbackQuery] = None, m: Optional[Message] = None) -> None:
+    """Shared tail of reject / ban started from inline buttons."""
+    if store.is_owner(target):
+        return
+    if action == "reject":
+        ok = store.reject(target, by, reason)
+        if ok:
+            await safe_send(target, header("Request Declined", "❌") +
+                            (f"💬 {esc(reason)}\n\n" if reason else "") +
+                            (f"<i>You may send a new request after {REJECT_COOLDOWN_H} h.</i>" if REJECT_COOLDOWN_H
+                             else "<i>You may send a new request anytime.</i>"),
+                            reply_markup=locked_keyboard(ACCESS_REJECTED))
+        title = "Rejected" if ok else "Nothing to reject"
+    else:
+        store.ban(target, by, reason)
+        await clear_user_commands(target)
+        for j in [j for j in QUEUE if j.user_id == target]:
+            QUEUE.remove(j); j.status = "cancelled"; j.cleanup()
+        if ACTIVE and ACTIVE.user_id == target:
+            ACTIVE.cancel.set()
+        for jid, j in [(k, v) for k, v in PENDING.items() if v.user_id == target]:
+            PENDING.pop(jid, None); j.cleanup()
+        await safe_send(target, header("Access Blocked", "🚫") + "You have been blocked from using this bot." +
+                        (f"\n💬 {esc(reason)}" if reason else ""), reply_markup=ReplyKeyboardRemove())
+        title = "Banned"
+    text = header(title, "❌" if action == "reject" else "🚫") + f"👤 {user_line(target)}" + \
+        (f"\n💬 <i>{esc(reason)}</i>" if reason else "")
+    if q is not None:
+        await _edit(q, text, user_card_kb(target))
+    elif m is not None:
+        await m.reply(text, reply_markup=user_card_kb(target), disable_web_page_preview=True)
+    actor = (store.user(by) or {}).get("name", "admin")
+    await notify_admins(f"{'❌' if action == 'reject' else '🚫'} {user_link(by, actor)} {action}ed {user_line(target)}.",
+                        exclude=by)
+
 @app.on_message(filters.text & PRIVATE & authorized & ~filters.via_bot)
 async def handle_text(client: Client, m: Message):
     if not m.text or m.text.startswith("/"):
@@ -2317,6 +3371,31 @@ async def handle_text(client: Client, m: Message):
     text_lower = m.text.strip().lower()
 
     label = m.text.strip()
+
+    # ── Admin free-text states (custom duration / reject-ban reason) ──────────
+    state = USER_STATE.get(chat_id)
+    if state and state.get("state") in ("await_duration", "await_reason") and store.is_admin(m.from_user.id):
+        if label in MENU_BUTTONS or label in ALL_BUTTONS:
+            USER_STATE.pop(chat_id, None)        # admin tapped a menu button → abort the state
+        else:
+            USER_STATE.pop(chat_id, None)
+            target = int(state["target"])
+            if state["state"] == "await_duration":
+                if parse_duration(label) is None:
+                    USER_STATE[chat_id] = state
+                    return await m.reply("⚠️ I don't understand that duration. Try <code>45d</code>, <code>3m</code>, "
+                                         "<code>1y</code>, <code>forever</code> or <code>2026-12-31</code>.")
+                if store.is_banned(target):
+                    return await m.reply("🚫 User is banned — /unban first.")
+                a = await grant_and_notify(target, label, m.from_user.id)
+                if a is None:
+                    return await m.reply("⚠️ Could not approve.")
+                await notify_admins(f"✅ {user_link(m.from_user.id, m.from_user.first_name)} approved {user_line(target)} "
+                                    f"({plan_label(a.get('plan', label))}).", exclude=m.from_user.id)
+                return await m.reply(header("Approved", "✅") + f"👤 {user_line(target)}\n"
+                                     f"⏳ {b('♾ Lifetime' if not a.get('expires') else expiry_label(a['expires']))}",
+                                     reply_markup=user_card_kb(target), disable_web_page_preview=True)
+            return await finish_moderation(target, m.from_user.id, state.get("action", "reject"), label[:200], m=m)
 
     # ── Menu buttons → switch the bottom keyboard page ─────────────────────
     if label in MENU_BUTTONS:
@@ -2334,12 +3413,16 @@ async def handle_text(client: Client, m: Message):
         if btn_cmd in OWNER_BUTTONS.values() and not store.is_owner(m.from_user.id):
             # user somehow pressed an owner button (stale keyboard) → refresh their keyboard
             return await show_page(m, "main", "🔒 Owner only — menu refreshed.")
+        if btn_cmd in ADMIN_BUTTONS.values() and not store.is_admin(m.from_user.id):
+            return await show_page(m, "main", "🔒 Admins only — menu refreshed.")
         m.command = [btn_cmd]            # so handlers see it as a real command
         handler = {
             "start": cmd_start, "settings": cmd_settings, "queue": cmd_queue,
             "mystats": cmd_mystats, "cancel": cmd_cancel, "help": cmd_help, "id": cmd_id,
+            "access": cmd_access,
             "setlang": cmd_set_pref, "setformat": cmd_set_pref, "setsplit": cmd_set_pref, "app": cmd_app,
-            "stats": cmd_stats, "users": cmd_users, "broadcast": cmd_broadcast, "links": cmd_links,
+            "stats": cmd_stats, "users": cmd_users, "pending": cmd_pending,
+            "broadcast": cmd_broadcast, "links": cmd_links,
         }[btn_cmd]
         return await handler(client, m)
 
@@ -2412,8 +3495,9 @@ def _api_user(request: web.Request) -> Optional[dict]:
 def _json(data: Any, status: int = 200) -> web.Response:
     return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
 
-def _err(msg: str, status: int = 400, **extra) -> web.Response:
-    return _json({"ok": False, "error": msg, **extra}, status)
+def _err(msg: str, http_status: int = 400, **extra) -> web.Response:
+    """Error envelope. `extra` may carry an access `status` field — hence the `http_status` name."""
+    return _json({"ok": False, "error": msg, **extra}, http_status)
 
 def _job_public(j: Job, uid: int, position: int = 0) -> dict:
     eng = j.progress.get("engine")
@@ -2445,7 +3529,33 @@ def _config_public() -> dict:
         "split_presets": [{"kb": kb, "label": lbl} for kb, lbl in SPLIT_PRESETS],
         "split_range": [MIN_SPLIT_KB, MAX_SPLIT_KB], "max_input_mb": MAX_INPUT_MB,
         "max_jobs": MAX_JOBS_PER_USER, "input_exts": sorted(INPUT_EXTS),
-        "version": "4.0",
+        "plans": [{"code": c, "label": lbl} for c, (lbl, _spec) in PLAN_PRESETS.items()],
+        "reject_cooldown_h": REJECT_COOLDOWN_H, "reminder_days": EXPIRY_REMINDER_DAYS,
+        "version": VERSION,
+    }
+
+def _access_public(uid: int) -> dict:
+    """JSON view of a user's access block (for /api/me and admin lists)."""
+    a = store.access(uid)
+    status = store.status(uid)
+    label, icon = ACCESS_LABELS.get(status, ("Unknown", "❓"))
+    owner = store.is_owner(uid)
+    expires = 0 if owner else int(a.get("expires") or 0)
+    cooldown = 0
+    if status == ACCESS_REJECTED and REJECT_COOLDOWN_H:
+        cooldown = max(0, int(a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 - time.time()))
+    return {
+        "status": status, "label": label, "icon": icon,
+        "lifetime": status == ACCESS_APPROVED and not expires,
+        "expires": expires, "days_left": days_left(expires) if expires else None,
+        "expiry_label": ("♾ Lifetime" if status == ACCESS_APPROVED and not expires
+                         else expiry_label(expires) if expires else ""),
+        "plan": a.get("plan", ""), "plan_label": plan_label(a.get("plan", "")) if a.get("plan") else "",
+        "approved_by": a.get("approved_by", 0), "approved_at": a.get("approved_at", 0),
+        "requested_at": a.get("requested_at", 0), "requests": a.get("requests", 0),
+        "note": a.get("note", ""), "reason": a.get("reason", ""), "updated": a.get("updated", 0),
+        "cooldown": cooldown, "can_request": status in (ACCESS_NONE, ACCESS_EXPIRED, ACCESS_REJECTED) and not cooldown,
+        "history": (a.get("history") or [])[-8:][::-1],
     }
 
 def _me_payload(tg: dict) -> dict:
@@ -2453,25 +3563,46 @@ def _me_payload(tg: dict) -> dict:
     u = store.user(uid) or {}
     lang, fmt, split = user_prefs(uid)
     return {
-        "id": uid, "name": u.get("name") or tg["name"], "username": tg.get("username", ""),
-        "photo": tg.get("photo", ""), "role": "owner" if store.is_owner(uid) else u.get("role", "user"),
-        "owner": store.is_owner(uid), "joined": u.get("joined", 0),
+        "id": uid, "name": u.get("name") or tg["name"], "username": tg.get("username", "") or u.get("username", ""),
+        "photo": tg.get("photo", ""), "role": store.role(uid),
+        "owner": store.is_owner(uid), "admin": store.is_admin(uid), "joined": u.get("joined", 0),
+        "authorized": store.is_authorized(uid),
+        "access": _access_public(uid),
         "prefs": {"lang": lang, "fmt": fmt, "split": split},
         "stats": {**{"jobs": 0, "parts": 0, "chars": 0}, **(u.get("stats") or {})},
         "active_jobs": user_job_count(uid),
     }
 
 def _require(request: web.Request) -> Tuple[Optional[dict], Optional[web.Response]]:
+    """Authenticated *and* approved user, else an error response."""
     tg = _api_user(request)
     if not tg:
         return None, _err("Unauthorized — open this page from Telegram.", 401, code="auth")
-    if PUBLIC_MODE:
-        store.ensure_user(tg["id"], tg["name"])
+    store.ensure_user(tg["id"], tg["name"], tg.get("username", ""))
     if not store.is_authorized(tg["id"]):
-        return tg, _err("This bot is private. Enter the security code.", 403, code="locked", id=tg["id"])
-    store.ensure_user(tg["id"], tg["name"])
+        status = store.status(tg["id"])
+        return tg, _err("This bot is private — request access from the owner.", 403,
+                        code="locked", status=status, access_status=status, id=tg["id"],
+                        me=_me_payload(tg), config=_config_public())
     store.touch(tg["id"])
     return tg, None
+
+def _require_admin(request: web.Request, owner: bool = False) -> Tuple[Optional[dict], Optional[web.Response]]:
+    tg, err = _require(request)
+    if err:
+        return tg, err
+    if owner and not store.is_owner(tg["id"]):
+        return tg, _err("Owner only", 403)
+    if not owner and not store.is_admin(tg["id"]):
+        return tg, _err("Admins only", 403)
+    return tg, None
+
+async def _body(request: web.Request) -> dict:
+    try:
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 async def api_me(request: web.Request) -> web.Response:
     tg, err = _require(request)
@@ -2479,34 +3610,62 @@ async def api_me(request: web.Request) -> web.Response:
         return err
     return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
 
-async def api_unlock(request: web.Request) -> web.Response:
+async def api_access(request: web.Request) -> web.Response:
+    """Own access card — works for everyone who is signed in (also locked users)."""
     tg = _api_user(request)
     if not tg:
         return _err("Unauthorized", 401, code="auth")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    code_ = str(body.get("code", "")).strip()
-    if store.is_authorized(tg["id"]):
-        return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
-    if not code_ or not store.security_code or not hmac.compare_digest(code_, store.security_code):
-        await asyncio.sleep(1.0)          # slow down brute force
-        return _err("Wrong security code.", 403, code="locked", id=tg["id"])
-    store.authorize(tg["id"], tg["name"])
-    asyncio.create_task(set_user_commands(tg["id"], force=True))
-    asyncio.create_task(safe_send(tg["id"], header("Access Granted", "✅") +
-                                  f"Welcome, {b(tg['name'])}! Unlocked via Mini App.\nSend /start to see the menu.",
-                                  reply_markup=reply_keyboard(tg["id"])))
+    store.ensure_user(tg["id"], tg["name"], tg.get("username", ""))
     return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
+
+async def api_request_access(request: web.Request) -> web.Response:
+    """Locked user asks for approval from the Mini App (optional note)."""
+    tg = _api_user(request)
+    if not tg:
+        return _err("Unauthorized", 401, code="auth")
+    uid = tg["id"]
+    if store.is_banned(uid):
+        return _err("Access blocked.", 403, code="banned")
+    body = await _body(request)
+    note = str(body.get("note", "") or "").strip()[:200]
+    if store.is_authorized(uid):
+        return _json({"ok": True, "already": True, "me": _me_payload(tg), "config": _config_public()})
+    ok, why = await send_access_request(uid, tg["name"], tg.get("username", ""), note)
+    if not ok and why == "pending" and note:
+        a = store.access(uid)
+        a["note"] = note
+        store._save_user(uid)
+        why = "noted"
+    if not ok and why == "cooldown":
+        a = store.access(uid)
+        wait = a.get("updated", 0) + REJECT_COOLDOWN_H * 3600 - time.time()
+        return _err(f"Your last request was declined. Try again in {fmt_time(wait)}.", 429,
+                    code="cooldown", me=_me_payload(tg))
+    if ok:
+        asyncio.create_task(safe_send(uid, header("Request Sent", "📨") +
+                                      "Your access request has been sent to the owner.\n"
+                                      "You will be notified here once it is decided.",
+                                      reply_markup=locked_keyboard(ACCESS_PENDING)))
+    return _json({"ok": True, "sent": ok, "why": why, "me": _me_payload(tg), "config": _config_public()})
+
+async def api_withdraw_request(request: web.Request) -> web.Response:
+    tg = _api_user(request)
+    if not tg:
+        return _err("Unauthorized", 401, code="auth")
+    uid = tg["id"]
+    a = store.access(uid)
+    if a["status"] == ACCESS_PENDING:
+        a.update({"status": ACCESS_NONE, "updated": int(time.time())})
+        store._save_user(uid)
+        store.audit("withdraw", uid, uid)
+    return _json({"ok": True, "me": _me_payload(tg)})
 
 async def api_settings(request: web.Request) -> web.Response:
     tg, err = _require(request)
     if err:
         return err
-    try:
-        body = await request.json()
-    except Exception:
+    body = await _body(request)
+    if not body:
         return _err("Invalid JSON")
     uid = tg["id"]
     changed = []
@@ -2547,9 +3706,8 @@ async def api_job_start(request: web.Request) -> web.Response:
     tg, err = _require(request)
     if err:
         return err
-    try:
-        body = await request.json()
-    except Exception:
+    body = await _body(request)
+    if not body:
         return _err("Invalid JSON")
     uid = tg["id"]
     job = PENDING.get(str(body.get("job_id", "")))
@@ -2582,10 +3740,7 @@ async def api_job_cancel(request: web.Request) -> web.Response:
     tg, err = _require(request)
     if err:
         return err
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _body(request)
     uid = tg["id"]
     target = str(body.get("job_id", "") or "")
     owner = store.is_owner(uid)
@@ -2603,68 +3758,143 @@ async def api_job_cancel(request: web.Request) -> web.Response:
         asyncio.create_task(notify_positions())
     return _json({"ok": True, "cancelled": n})
 
+# ── admin API (owner + admins) ─────────────────────────────────────────────
+def _user_public(uid: int, u: dict) -> dict:
+    return {"id": uid, "name": u.get("name", "User"), "username": u.get("username", ""),
+            "role": store.role(uid), "joined": u.get("joined", 0), "last_seen": u.get("last_seen", 0),
+            "stats": {**{"jobs": 0, "parts": 0, "chars": 0}, **(u.get("stats") or {})},
+            "lang": u.get("lang", DEFAULT_LANG), "access": _access_public(uid),
+            "env": uid in AUTHORIZED_USERS or uid in ADMIN_USERS or uid == OWNER_ID}
+
+_STATUS_ORDER = {ACCESS_PENDING: 0, ACCESS_APPROVED: 1, ACCESS_EXPIRED: 2, ACCESS_NONE: 3,
+                 ACCESS_REJECTED: 4, ACCESS_BANNED: 5}
+
 async def api_admin_overview(request: web.Request) -> web.Response:
-    tg, err = _require(request)
+    tg, err = _require_admin(request)
     if err:
         return err
-    if not store.is_owner(tg["id"]):
-        return _err("Owner only", 403)
-    users = []
-    for uid, u in sorted(store.users.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True):
-        users.append({"id": uid, "name": u.get("name", "User"), "role": u.get("role", "user"),
-                      "joined": u.get("joined", 0), "last_seen": u.get("last_seen", 0),
-                      "stats": u.get("stats", {}), "lang": u.get("lang", DEFAULT_LANG)})
+    owner = store.is_owner(tg["id"])
+    users = [_user_public(uid, u) for uid, u in store.users.items()]
+    users.sort(key=lambda x: (_STATUS_ORDER.get(x["access"]["status"], 9), -x["last_seen"]))
     return _json({"ok": True, "stats": store.stats, "uptime": int(time.time() - store.booted),
-                  "users": users, "chats": len(store.chats), "recent": store.recent_history(30),
+                  "users": users, "counts": store.count_by_status(),
+                  "pending": [_user_public(uid, u) for uid, u in store.pending_users()],
+                  "admins": [a for a in store.admins() if not store.is_owner(a)], "owner_id": store.owner_id,
+                  "chats": len(store.chats), "recent": store.recent_history(30) if owner else [],
+                  "audit": store.recent_audit(40) if owner else [],
                   "active": _job_public(ACTIVE, tg["id"]) if ACTIVE else None,
                   "queue_len": len(QUEUE), "pending_len": len(PENDING),
                   "db": store.connected, "db_budget": store.budget_info() if store.connected else None,
-                  "public_mode": PUBLIC_MODE,
-                  "backup_group": BACKUP_GROUP_ID, "security_code_set": bool(store.security_code)})
+                  "public_mode": PUBLIC_MODE, "backup_group": BACKUP_GROUP_ID,
+                  "env_admins": ADMIN_USERS, "env_users": AUTHORIZED_USERS})
+
+async def api_admin_user(request: web.Request) -> web.Response:
+    tg, err = _require_admin(request)
+    if err:
+        return err
+    try:
+        uid = int(request.match_info["id"])
+    except (KeyError, ValueError):
+        return _err("Bad id")
+    u = store.user(uid)
+    if not u:
+        return _err("Unknown user", 404)
+    return _json({"ok": True, "user": _user_public(uid, u), "history": store.user_history(uid, 15)})
 
 async def api_admin_users(request: web.Request) -> web.Response:
-    tg, err = _require(request)
+    """Approval actions from the Mini App:
+       {action: approve|extend|reject|revoke|ban|unban|promote|demote, id, duration?, reason?}"""
+    tg, err = _require_admin(request)
     if err:
         return err
-    if not store.is_owner(tg["id"]):
-        return _err("Owner only", 403)
+    by = tg["id"]
+    body = await _body(request)
+    action = str(body.get("action", "") or "").lower()
     try:
-        body = await request.json()
-        action = body.get("action"); uid = int(body.get("id"))
-    except Exception:
-        return _err("Expected {action: add|remove, id: <int>}")
-    if action == "add":
-        store.authorize(uid, str(body.get("name") or "Added via Mini App")[:64])
-        asyncio.create_task(set_user_commands(uid, force=True))
-        asyncio.create_task(safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.",
-                                      reply_markup=reply_keyboard(uid)))
-        return _json({"ok": True})
-    if action == "remove":
-        if not store.revoke(uid):
-            return _err("Not found (or is the owner)", 404)
+        uid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return _err("Expected {action, id: <int>}")
+    if action in ("add", "remove"):                      # v4 names still accepted
+        action = "approve" if action == "add" else "revoke"
+    if store.is_owner(uid):
+        return _err("The owner cannot be modified", 403)
+    if store.role(uid) == "admin" and not store.is_owner(by) and action in ("reject", "revoke", "ban", "demote"):
+        return _err("Only the owner can moderate an admin", 403)
+    reason = str(body.get("reason", "") or "").strip()[:200]
+    actor_name = (store.user(by) or {}).get("name") or tg["name"]
+
+    if action in ("approve", "extend"):
+        spec = str(body.get("duration", "") or DEFAULT_APPROVAL).strip()
+        if parse_duration(spec) is None:
+            return _err("Unknown duration — try 1w, 1m, 1y, forever, 45d or 2026-12-31")
+        if store.is_banned(uid):
+            return _err("User is banned — unban first", 409)
+        a = await grant_and_notify(uid, spec, by, extend=(action == "extend"))
+        if a is None:
+            return _err("Could not approve", 409)
+        asyncio.create_task(notify_admins(f"✅ {user_link(by, actor_name)} {'extended' if action == 'extend' else 'approved'} "
+                                          f"{user_line(uid)} ({plan_label(a.get('plan', spec))}).", exclude=by))
+    elif action == "reject":
+        if not store.reject(uid, by, reason):
+            return _err("Unknown user", 404)
+        asyncio.create_task(safe_send(uid, header("Request Declined", "❌") +
+                                      (f"💬 {esc(reason)}\n\n" if reason else "") +
+                                      (f"<i>You may send a new request after {REJECT_COOLDOWN_H} h.</i>" if REJECT_COOLDOWN_H
+                                       else "<i>You may send a new request anytime.</i>"),
+                                      reply_markup=locked_keyboard(ACCESS_REJECTED)))
+    elif action == "revoke":
+        if not store.revoke(uid, by, reason):
+            return _err("User has no access to revoke", 404)
         asyncio.create_task(clear_user_commands(uid))
-        asyncio.create_task(safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed.",
-                                      reply_markup=ReplyKeyboardRemove()))
-        return _json({"ok": True})
-    return _err("Unknown action")
+        asyncio.create_task(safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed." +
+                                      (f"\n💬 {esc(reason)}" if reason else "") + "\n\n<i>You may request access again.</i>",
+                                      reply_markup=locked_keyboard(ACCESS_NONE)))
+    elif action == "ban":
+        store.ban(uid, by, reason)
+        asyncio.create_task(clear_user_commands(uid))
+        for j in [j for j in QUEUE if j.user_id == uid]:
+            QUEUE.remove(j); j.status = "cancelled"; j.cleanup()
+        if ACTIVE and ACTIVE.user_id == uid:
+            ACTIVE.cancel.set()
+        for jid, j in [(k, v) for k, v in PENDING.items() if v.user_id == uid]:
+            PENDING.pop(jid, None); j.cleanup()
+        asyncio.create_task(safe_send(uid, header("Access Blocked", "🚫") + "You have been blocked from using this bot." +
+                                      (f"\n💬 {esc(reason)}" if reason else ""), reply_markup=ReplyKeyboardRemove()))
+    elif action == "unban":
+        if not store.unban(uid, by):
+            return _err("User is not banned", 409)
+        asyncio.create_task(safe_send(uid, header("Unblocked", "♻️") + "You may request access again.",
+                                      reply_markup=locked_keyboard(ACCESS_NONE)))
+    elif action in ("promote", "demote"):
+        if not store.is_owner(by):
+            return _err("Owner only", 403)
+        if action == "demote" and uid in ADMIN_USERS:
+            return _err("This admin is configured in ADMIN_USERS env — remove it there first", 409)
+        if not store.set_admin(uid, action == "promote", by):
+            return _err("Already an admin" if action == "promote" else "Not an admin", 409)
+        asyncio.create_task(set_user_commands(uid, force=True))
+        asyncio.create_task(safe_send(uid, header("You are an Admin", "🛡") + "You can now approve access requests.\n"
+                                      "Send /start to refresh your menu." if action == "promote"
+                                      else "ℹ️ You are no longer an admin. Send /start to refresh your menu.",
+                                      reply_markup=reply_keyboard(uid)))
+    else:
+        return _err("Unknown action")
+    u = store.user(uid) or store.ensure_user(uid, "User")
+    return _json({"ok": True, "user": _user_public(uid, u), "counts": store.count_by_status()})
 
 async def api_admin_broadcast(request: web.Request) -> web.Response:
-    tg, err = _require(request)
+    tg, err = _require_admin(request, owner=True)
     if err:
         return err
-    if not store.is_owner(tg["id"]):
-        return _err("Owner only", 403)
-    try:
-        body = await request.json()
-        text = str(body.get("text", "")).strip()
-    except Exception:
-        text = ""
+    body = await _body(request)
+    text = str(body.get("text", "") or "").strip()
     if not text or len(text) > 3500:
         return _err("Text required (max 3500 chars)")
+    recipients = store.approved_users()
 
     async def _run():
         sent = failed = 0
-        for uid in list(store.users.keys()):
+        for uid in recipients:
             try:
                 await app.send_message(uid, header("Announcement", "📣") + esc(text))
                 sent += 1
@@ -2676,23 +3906,7 @@ async def api_admin_broadcast(request: web.Request) -> web.Response:
         await safe_send(tg["id"], f"📣 Broadcast done.\n✅ Sent: {b(sent)}  ·  ❌ Failed: {b(failed)}")
 
     asyncio.create_task(_run())
-    return _json({"ok": True, "recipients": len(store.users)})
-
-async def api_admin_setcode(request: web.Request) -> web.Response:
-    tg, err = _require(request)
-    if err:
-        return err
-    if not store.is_owner(tg["id"]):
-        return _err("Owner only", 403)
-    try:
-        body = await request.json()
-        new_code = str(body.get("code", "")).strip()
-    except Exception:
-        new_code = ""
-    if len(new_code) < 6:
-        return _err("Code must be at least 6 characters")
-    store.set_security_code(new_code)
-    return _json({"ok": True, "persistent": store.connected})
+    return _json({"ok": True, "recipients": len(recipients)})
 
 # ── static Mini App files ──────────────────────────────────────────────────
 _STATIC_TYPES = {".html": "text/html", ".css": "text/css", ".js": "application/javascript",
@@ -2724,13 +3938,14 @@ async def health(_request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok" if not SHUTTING_DOWN else "shutting_down",
         "bot": BOT_USERNAME,
-        "version": "4.0",
+        "version": VERSION,
         "uptime_sec": int(time.time() - store.booted),
         "db": "mongodb" if store.connected else "memory",
         "db_size_mb": store.db_size_mb if store.connected else 0,
         "db_budget_mb": DB_BUDGET_MB if store.connected else 0,
         "mini_app": bool(MINI_APP_URL),
         "users": len(store.users),
+        "access": store.count_by_status(),
         "active": ACTIVE.novel_name if ACTIVE else None,
         "queue": len(QUEUE),
         "pending": len(PENDING),
@@ -2757,15 +3972,17 @@ async def start_health_server() -> web.AppRunner:
         # Mini App
         web.get("/app", miniapp_file), web.get("/app/", miniapp_file), web.get("/app/{path:.*}", miniapp_file),
         web.get("/api/me", api_me),
-        web.post("/api/unlock", api_unlock),
+        web.get("/api/access", api_access),
+        web.post("/api/access/request", api_request_access),
+        web.post("/api/access/withdraw", api_withdraw_request),
         web.post("/api/settings", api_settings),
         web.get("/api/jobs", api_jobs),
         web.post("/api/jobs/start", api_job_start),
         web.post("/api/jobs/cancel", api_job_cancel),
         web.get("/api/admin/overview", api_admin_overview),
+        web.get("/api/admin/user/{id}", api_admin_user),
         web.post("/api/admin/users", api_admin_users),
         web.post("/api/admin/broadcast", api_admin_broadcast),
-        web.post("/api/admin/setcode", api_admin_setcode),
     ])
     runner = web.AppRunner(web_app, access_log=None)
     await runner.setup()
@@ -2864,7 +4081,7 @@ async def main():
                         f"🗄 Storage: {b('MongoDB · ' + MONGO_DB if store.connected else 'in-memory (no database)')}\n"
                         f"📱 Mini App: {b('enabled' if MINI_APP_URL.startswith('https://') else 'not configured')}")
     else:
-        log.warning("No owner yet — first user to send the security code becomes owner.")
+        log.warning("No OWNER_ID configured — nobody can approve access requests! Set OWNER_ID in the environment.")
 
     await idle()                                  # blocks until SIGINT/SIGTERM
 

@@ -1,6 +1,6 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v4.0 · MongoDB + Telegram Mini App edition, built for the Render.com free tier.**
+**v5.0 · Approval-based access + MongoDB + Telegram Mini App edition, built for the Render.com free tier.**
 
 A single-file Telegram bot (Pyrogram + aiohttp) that translates whole
 documents (EPUB / TXT / DOCX / PDF) into 25 languages and delivers the result
@@ -8,16 +8,23 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 
 > 🗄 **MongoDB persistence out of the box.** The bot ships with the project's own
 > MongoDB Atlas free-tier (M0, 512 MB) connection string baked in, so users, settings,
-> stats, security code and job history survive every deploy with zero setup.
+> stats, access plans, audit log and job history survive every deploy with zero setup.
 > Set `MONGO_URI` to use your own cluster, or `MONGO_URI=off` for the old fully-in-RAM mode.
 >
 > 💾 **Free-tier safe.** Only *metadata* is stored — uploaded / translated files never
 > touch the database. A built-in storage guard (`DB_BUDGET_MB`, default 400 MB) prunes
 > old job history (per-user cap → global cap → TTL) so the M0 tier can never fill up.
 >
+> 🎫 **Approval-based access (v5).** No more shared security code. New users tap
+> **🙋 Request Access**, the owner/admins get an inline card and approve with one tap
+> for **1 week · 1 month · 3 months · 6 months · 1 year · lifetime** (or any custom
+> duration like `45d` / `2026-12-31`). Access expires automatically, users get a reminder
+> before it does, everything is written to an audit log.
+>
 > 📱 **Telegram Mini App.** The same process serves a premium dashboard at
-> `/app` — settings, live job progress, history and an owner panel — opened
-> straight from the bot's menu button / bottom keyboard.
+> `/app` — settings, live job progress, history, your access plan and an admin panel
+> (pending requests, user management, audit log) — opened straight from the bot's
+> menu button / bottom keyboard.
 
 ## ✨ Features
 
@@ -29,14 +36,20 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 - **Live dashboard** – progress bar, speed, ETA, flood-safe message edits
 - **Job queue** with position updates, per-user job limit, cancel button, 4-step wizard + ⚡ Quick Start
 - **Role-based menus** – persistent bottom reply keyboard + Telegram “/” command list.
-  Locked visitors see only `/start` `/id` + a 🆔 My ID button; authorized users get the
-  user buttons/commands; the owner additionally gets 👑 Owner Panel · 👥 Users · 📣 Broadcast · 🔗 Links
+  Locked visitors see only `/start` `/request` `/access` `/id`; approved users get the
+  user buttons/commands; admins additionally get ⏳ Pending · 👥 Users · ✅ Approve…; the owner
+  gets 👑 Owner Panel · 🛡 Admins · 📜 Audit · 📣 Broadcast · 🔗 Links
   (per-chat `BotCommandScope`, so each person sees exactly the commands they can use)
-- **Security-code gate**, owner panel, `/adduser`, `/deluser`, `/broadcast`, `/setcode`, `/id`
+- **Approval-based access** – states `none → pending → approved → expired` (+ `rejected`, `banned`).
+  Requests arrive as inline cards (✅ 1w · 1m · 3m · 6m · 1y · ♾ · ❌ Reject); admins can also
+  `/approve <id> <duration>`, `/extend`, `/reject`, `/revoke`, `/ban`, `/unban`, `/userinfo`.
+  Hourly sweep expires plans, sends reminders `EXPIRY_REMINDER_DAYS` before, and a rejected user
+  may re-request after `REJECT_COOLDOWN_H`. Owner can promote admins (`/addadmin`) and read `/audit`.
+  v4 users unlocked with the old code are migrated to lifetime access (`LEGACY_USERS=keep`)
 - **Optional backup group** – each job gets its own forum topic with all delivered parts (set `BACKUP_GROUP_ID=0` to disable)
 - **MongoDB persistence (optional)** – write-through RAM cache + background writer (`motor`), so handlers never block on the DB. Collections: `users`, `stats`, `jobs` (TTL history, `DB_JOB_TTL_DAYS`), `chats`, `meta`.
   **Storage guard**: every 10 min (and after bursts of jobs) the janitor reads `dbStats`; if the DB exceeds 80 % of `DB_BUDGET_MB` or `jobs` exceeds `DB_MAX_JOB_DOCS`, old history is pruned (per-user `HISTORY_LIMIT` → global cap → halve cap until under budget). Usage is shown in `/stats`, the Mini App owner panel and `/health`
-- **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🔒 unlock with security code, 👑 owner panel (users add/remove, broadcast, change code, global stats). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
+- **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🎫 my access card + expiry banner, 🔒 locked screen with **Request Access** / pending status / withdraw (auto re-checks while pending), 👑 admin panel (pending requests with one-tap plans, user list with status filters, per-user sheet: approve / extend / custom duration / reject / revoke / ban / unban / promote, audit log, broadcast). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
 - **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
 
@@ -52,8 +65,7 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
    | `API_ID`        | https://my.telegram.org → API development tools             |
    | `API_HASH`      | same page                                                   |
    | `BOT_TOKEN`     | @BotFather → `/newbot`                                      |
-   | `SECURITY_CODE` | any secret ≥ 6 chars users must send to unlock the bot      |
-   | `OWNER_ID`      | your numeric Telegram ID (send `/id` to the bot, or @userinfobot) |
+   | `OWNER_ID`      | your numeric Telegram ID (send `/id` to the bot, or @userinfobot) — **required**, the owner approves everyone else |
 
    Optional: `MONGO_URI` → your own free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
    connection string (`mongodb+srv://…`). Allow access from `0.0.0.0/0` in Atlas Network Access.
@@ -67,20 +79,23 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 > - The instance is spun down after 15 min without HTTP traffic. The built-in
 >   keep-alive pings `RENDER_EXTERNAL_URL/health` every 10 min to prevent that
 >   (`KEEP_ALIVE=0` to disable). Free tier also has a monthly hour budget.
-> - With `MONGO_URI=off` every deploy/restart wipes memory: users authorised with the code or
->   `/adduser` must re-send the code. Put permanent IDs in `AUTHORIZED_USERS` — or keep MongoDB on.
-> - Set `OWNER_ID` explicitly; otherwise the first person who sends the code
->   after each restart becomes the owner.
+> - With `MONGO_URI=off` every deploy/restart wipes memory: approvals, pending requests and the
+>   audit log are lost. Put permanent IDs in `AUTHORIZED_USERS` / `ADMIN_USERS` — or keep MongoDB on.
+> - Set `OWNER_ID` explicitly — without an owner nobody can approve requests.
 
 ## ⚙️ Configuration
 
 | Variable             | Default | Description                                                   |
 |----------------------|---------|---------------------------------------------------------------|
 | `API_ID` / `API_HASH` / `BOT_TOKEN` | — | **Required** Telegram credentials                    |
-| `SECURITY_CODE`      | —       | Code users send once to unlock (required unless `PUBLIC_MODE=1` or IDs given) |
-| `OWNER_ID`           | `0`     | Permanent owner. `0` → first unlocked user becomes owner       |
-| `AUTHORIZED_USERS`   | —       | Comma-separated IDs pre-authorised on every start             |
-| `PUBLIC_MODE`        | `0`     | `1` → anyone can use the bot, no code needed                  |
+| `OWNER_ID`           | `0`     | Permanent owner (approves requests, manages admins)            |
+| `ADMIN_USERS`        | —       | Comma-separated IDs that are admins on every start (can approve users) |
+| `AUTHORIZED_USERS`   | —       | Comma-separated IDs with lifetime access on every start        |
+| `PUBLIC_MODE`        | `0`     | `1` → everyone is approved automatically                       |
+| `DEFAULT_APPROVAL`   | `1m`    | Duration used by `/approve <id>` / `/adduser` without a duration (`1w` `1m` `1y` `forever` `45d`) |
+| `EXPIRY_REMINDER_DAYS` | `3`   | Remind users N days before their access expires (0 = off)      |
+| `REJECT_COOLDOWN_H`  | `24`    | Hours a rejected user must wait before requesting again (0 = none) |
+| `LEGACY_USERS`       | `keep`  | v4 users unlocked with the old code: `keep` (lifetime) or `reapprove` |
 | `MONGO_URI`          | built-in Atlas M0 | MongoDB connection string. `off` → in-memory only      |
 | `MONGO_DB`           | `noveltranslator` | Database name                                        |
 | `HISTORY_LIMIT`      | `30`    | Jobs kept per user in history (5–100)                          |
@@ -106,13 +121,23 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 git clone https://github.com/Nitesh99390/India.git && cd India
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, SECURITY_CODE, OWNER_ID
+cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 python bot.py             # http://localhost:10000/health
 ```
 
 Test the Mini App UI without Telegram: set `MINIAPP_DEV_USER=<your id>` and open
 `http://localhost:10000/app` — the API treats you as that user (only works when
 `RENDER_EXTERNAL_URL` is unset, i.e. never in production).
+
+Or use the offline harness (no Telegram connection, fake jobs + seeded users in every access state):
+
+```bash
+tests/devctl.sh start owner   8080   # admin panel with pending requests
+tests/devctl.sh start locked  8083   # "Request Access" screen
+tests/devctl.sh start pending 8081   # waiting-for-approval screen  (also: admin · user · expired · rejected · banned)
+python tests/test_api_flow.py 8080   # exercises every /api/admin/users action + the locked-user flow
+tests/devctl.sh stopall
+```
 
 ### Docker
 
@@ -123,8 +148,11 @@ docker run -d --env-file .env -p 10000:10000 noveltranslator
 
 ## 💬 Commands
 
-**Users**: `/start` `/app` `/settings` `/queue` `/cancel` `/mystats` `/id` `/help`
-**Owner**: `/stats` `/users` `/adduser <id>` `/deluser <id>` `/broadcast <text>` `/setcode <code>` `/links`
+**Locked visitors**: `/start` `/request [note]` `/access` `/id`
+**Users**: `/start` `/app` `/settings` `/queue` `/cancel` `/mystats` `/access` `/id` `/help`
+**Admins**: `/pending` `/users [filter]` `/userinfo <id>` `/approve <id> [1w|1m|3m|6m|1y|forever|45d|2026-12-31]` `/extend <id> <duration>` `/reject <id> [reason]` `/revoke <id> [reason]` `/ban <id> [reason]` `/unban <id>`
+**Owner**: `/stats` `/admins` `/addadmin <id>` `/deladmin <id>` `/audit` `/broadcast <text>` `/links`
+(`/adduser` and `/deluser` still work as aliases of `/approve` and `/revoke`.)
 
 ## 📱 Mini App API (served by `bot.py`)
 
@@ -132,22 +160,24 @@ All endpoints expect `Authorization: tma <initData>` (Telegram WebApp `initData`
 
 | Method | Path                    | Purpose                                   |
 |--------|-------------------------|-------------------------------------------|
-| GET    | `/api/me`               | Profile, prefs, stats + public config      |
-| POST   | `/api/unlock`           | `{code}` → unlock a locked user            |
+| GET    | `/api/me`               | Profile, prefs, stats, access + public config. Locked users get `403 {code:"locked", me, config}` |
+| GET    | `/api/access`           | Own access card — works while locked        |
+| POST   | `/api/access/request`   | `{note?}` → ask the owner for approval      |
+| POST   | `/api/access/withdraw`  | Cancel a pending request                    |
 | POST   | `/api/settings`         | `{lang?, fmt?, split?}`                    |
 | GET    | `/api/jobs`             | Active / queue / pending uploads / history |
 | POST   | `/api/jobs/start`       | `{job_id, lang, fmt, split}` finish wizard |
 | POST   | `/api/jobs/cancel`      | `{job_id?}` cancel own (owner: any) jobs   |
-| GET    | `/api/admin/overview`   | Owner: users, global stats, recent jobs    |
-| POST   | `/api/admin/users`      | Owner: `{action: add\|remove, id}`        |
-| POST   | `/api/admin/broadcast`  | Owner: `{text}`                            |
-| POST   | `/api/admin/setcode`    | Owner: `{code}`                            |
+| GET    | `/api/admin/overview`   | Admins: users, pending requests, counts, stats (+ audit & recent jobs for the owner) |
+| GET    | `/api/admin/user/{id}`  | Admins: one user + job history             |
+| POST   | `/api/admin/users`      | Admins: `{action: approve\|extend\|reject\|revoke\|ban\|unban\|promote\|demote, id, duration?, reason?}` (`add`/`remove` still accepted) |
+| POST   | `/api/admin/broadcast`  | Owner: `{text}` → all approved users        |
 
 Static files live in `miniapp/` (`index.html`, `style.css`, `app.js` — no build step).
 
 ## 🔒 Security
 
 - No credentials are hard-coded; the bot refuses to start if required env vars are missing.
-- The security-code message is deleted from the chat after a successful unlock.
+- Nobody can use the bot until the owner or an admin approves them; approvals carry an expiry and every decision is audited (`/audit`, Mini App audit log).
 - Mini App requests are authenticated with Telegram's `initData` HMAC (bot-token derived key, 24 h max age); the dev-user bypass is disabled whenever `RENDER_EXTERNAL_URL` is set.
 - `.env`, sessions and temp folders are git-ignored. Rotate your bot token if it was ever shared publicly.
