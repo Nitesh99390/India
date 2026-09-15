@@ -33,11 +33,18 @@ services:
         value: ""
       - key: PUBLIC_MODE           # "1" → anyone can use the bot (no code)
         value: "0"
-      # ── MongoDB (optional). Atlas free tier: mongodb+srv://… — leave empty for RAM-only ──
+      # ── MongoDB. Empty → built-in Atlas free-tier cluster · your own mongodb+srv://… · "off" = RAM-only ──
       - key: MONGO_URI
         sync: false
       - key: MONGO_DB
         value: noveltranslator
+      # Free-tier storage guard (Atlas M0 = 512 MB): prune old job history above 80 % of the budget
+      - key: DB_BUDGET_MB
+        value: "400"
+      - key: DB_MAX_JOB_DOCS
+        value: "3000"
+      - key: DB_JOB_TTL_DAYS
+        value: "60"
       # ── Mini App: RENDER_EXTERNAL_URL is injected by Render → /app works automatically ──
       # - key: PUBLIC_URL
       #   value: https://your-custom-domain.example

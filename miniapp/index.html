@@ -142,6 +142,13 @@
             <div class="stat"><div class="stat-v" id="a-cancel">0</div><div class="stat-l">Cancelled</div></div>
           </div>
 
+          <div class="card" id="db-card">
+            <div class="card-title">🗄 Database storage</div>
+            <div class="progress"><i id="db-bar"></i></div>
+            <div class="progress-meta"><span id="db-size">—</span><span id="db-docs">—</span></div>
+            <p class="muted small" id="db-note">Only metadata is stored (users · settings · counters · job history). Files never touch the database.</p>
+          </div>
+
           <div class="card">
             <div class="card-title">👥 Users</div>
             <form id="adduser-form" class="inline-input">

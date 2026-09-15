@@ -143,10 +143,21 @@ RENDER_EXTERNAL_URL = _env("RENDER_EXTERNAL_URL").rstrip("/")
 KEEP_ALIVE = _env_bool("KEEP_ALIVE", True)
 KEEP_ALIVE_INTERVAL = max(60, _env_int("KEEP_ALIVE_INTERVAL", 600))
 
-# MongoDB (optional — without it everything lives in RAM as before)
-MONGO_URI = _env("MONGO_URI") or _env("MONGODB_URI") or _env("DATABASE_URL")
+# MongoDB — Atlas free tier (M0, 512 MB). Env var wins; the baked-in string is
+# the project's own cluster so a fresh Render deploy is persistent out of the box.
+# ⚠️  Only *metadata* is stored (users · prefs · counters · tiny job history).
+#     Uploaded / translated files are NEVER written to the database.
+DEFAULT_MONGO_URI = ("mongodb+srv://bhuimharniteshbhuimhar_db_user:nitesh9939"
+                     "@nitesh99390.qbwrf1c.mongodb.net/?appName=Nitesh99390&retryWrites=true&w=majority")
+MONGO_URI = _env("MONGO_URI") or _env("MONGODB_URI") or _env("DATABASE_URL") or DEFAULT_MONGO_URI
+if MONGO_URI.lower() in ("0", "off", "none", "memory", "disabled"):   # explicit opt-out → RAM only
+    MONGO_URI = ""
 MONGO_DB = _env("MONGO_DB", "noveltranslator")
 HISTORY_LIMIT = max(5, min(_env_int("HISTORY_LIMIT", 30), 100))
+# Free-tier storage budget. Atlas M0 = 512 MB total; we keep a wide safety margin.
+DB_BUDGET_MB = max(50, min(_env_int("DB_BUDGET_MB", 400), 512))
+DB_MAX_JOB_DOCS = max(200, _env_int("DB_MAX_JOB_DOCS", 3000))      # global cap for the `jobs` collection
+DB_JOB_TTL_DAYS = max(7, min(_env_int("DB_JOB_TTL_DAYS", 60), 365))
 
 # Telegram Mini App — served by this very process at /app (needs a public HTTPS URL)
 PUBLIC_URL = (_env("PUBLIC_URL") or RENDER_EXTERNAL_URL).rstrip("/")
@@ -250,6 +261,12 @@ class Store:
         self.connected = False
         self._writes: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
+        # storage budget bookkeeping (free-tier guard)
+        self.db_size_mb: float = 0.0                        # dataSize + indexSize, refreshed by check_budget()
+        self.db_job_docs: int = 0
+        self.db_checked: float = 0.0
+        self.db_pruned_total: int = 0
+        self._history_writes = 0                            # inserts since last budget check
         if OWNER_ID:
             self.authorize(OWNER_ID, "Owner")
         for uid in AUTHORIZED_USERS:
@@ -267,20 +284,49 @@ class Store:
             client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000, appname="noveltranslator")
             await client.admin.command("ping")
             self.db = client[MONGO_DB]
-            await asyncio.gather(
-                self.db.jobs.create_index([("uid", 1), ("ts", -1)]),
-                self.db.jobs.create_index("ts", expireAfterSeconds=90 * 24 * 3600),
-                return_exceptions=True)
+            await self._ensure_indexes()
             await self._load()
             self._writes = asyncio.Queue()
             self._writer_task = asyncio.create_task(self._writer(), name="mongo_writer")
             self.connected = True
             log.info("MongoDB connected (db=%s, users=%d)", MONGO_DB, len(self.users))
+            try:
+                await self.check_budget(force=True)
+            except Exception as e:
+                log.debug("initial budget check skipped: %s", e)
             return True
         except Exception as e:
             log.error("MongoDB connection failed (%s) → falling back to in-memory storage", e)
             self.db = None
             return False
+
+    async def _ensure_indexes(self) -> None:
+        """Create the `jobs` indexes. The TTL index is (re)created whenever the
+        configured DB_JOB_TTL_DAYS differs from the one already on the server —
+        MongoDB refuses to change expireAfterSeconds via createIndex."""
+        want = DB_JOB_TTL_DAYS * 24 * 3600
+        try:
+            await self.db.jobs.create_index([("uid", 1), ("ts", -1)], name="uid_ts")
+        except Exception as e:
+            log.debug("index uid_ts: %s", e)
+        try:
+            existing = await self.db.jobs.index_information()
+        except Exception:
+            existing = {}
+        for name, info in existing.items():
+            keys = info.get("key") or []
+            if keys and keys[0][0] == "ts" and len(keys) == 1 and "expireAfterSeconds" in info:
+                if int(info["expireAfterSeconds"]) == want:
+                    return
+                try:
+                    await self.db.jobs.drop_index(name)
+                    log.info("jobs TTL index changed %ss → %ss", info["expireAfterSeconds"], want)
+                except Exception as e:
+                    log.debug("drop_index %s: %s", name, e)
+        try:
+            await self.db.jobs.create_index("ts", name="ts_ttl", expireAfterSeconds=want)
+        except Exception as e:
+            log.warning("jobs TTL index: %s", e)
 
     async def _load(self) -> None:
         """Merge persisted state into the RAM cache. Env-configured users win."""
@@ -345,6 +391,89 @@ class Store:
     def _enqueue(self, coro_factory) -> None:
         if self.db is not None and self._writes is not None:
             self._writes.put_nowait(coro_factory)
+
+    # ── free-tier storage budget ───────────────────────────────────────
+    async def db_usage(self) -> Tuple[float, int]:
+        """Return (size_mb, job_docs). size = data + indexes of the whole database."""
+        if self.db is None:
+            return 0.0, 0
+        st = await self.db.command("dbStats")                          # byte-precise, then convert
+        size_mb = (float(st.get("dataSize", 0) or 0) + float(st.get("indexSize", 0) or 0)) / (1024 * 1024)
+        docs = await self.db.jobs.estimated_document_count()
+        return round(size_mb, 2), int(docs)
+
+    async def prune_jobs(self, keep_docs: Optional[int] = None) -> int:
+        """Trim the `jobs` collection: per-user cap (HISTORY_LIMIT) first, then a
+        global cap so the collection can never outgrow the free tier."""
+        if self.db is None:
+            return 0
+        removed = 0
+        keep_docs = keep_docs if keep_docs is not None else DB_MAX_JOB_DOCS
+        # 1) per-user: anything older than the user's HISTORY_LIMIT-th newest job
+        pipeline = [{"$group": {"_id": "$uid", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": HISTORY_LIMIT}}}]
+        async for grp in self.db.jobs.aggregate(pipeline):
+            uid = grp["_id"]
+            cutoff = await self.db.jobs.find({"uid": uid}, {"ts": 1}).sort("ts", -1) \
+                .skip(HISTORY_LIMIT - 1).limit(1).to_list(1)
+            if cutoff:
+                r = await self.db.jobs.delete_many({"uid": uid, "ts": {"$lt": cutoff[0]["ts"]}})
+                removed += r.deleted_count
+        # 2) global cap
+        total = await self.db.jobs.estimated_document_count()
+        if total > keep_docs:
+            cutoff = await self.db.jobs.find({}, {"ts": 1}).sort("ts", -1).skip(keep_docs - 1).limit(1).to_list(1)
+            if cutoff:
+                r = await self.db.jobs.delete_many({"ts": {"$lt": cutoff[0]["ts"]}})
+                removed += r.deleted_count
+        # 3) users never seen for a year and with zero jobs are just noise
+        stale = int(time.time()) - 365 * 24 * 3600
+        try:
+            r = await self.db.users.delete_many({"last_seen": {"$lt": stale}, "stats.jobs": 0,
+                                                 "role": {"$ne": "owner"}})
+            for uid in [u for u, d in list(self.users.items())
+                        if d.get("last_seen", 0) < stale and not d.get("stats", {}).get("jobs")
+                        and d.get("role") != "owner" and u not in AUTHORIZED_USERS]:
+                self.users.pop(uid, None)
+            removed += r.deleted_count
+        except Exception as e:
+            log.debug("stale user prune: %s", e)
+        if removed:
+            self.db_pruned_total += removed
+            log.info("DB prune: removed %d documents", removed)
+        return removed
+
+    async def check_budget(self, force: bool = False) -> None:
+        """Keep the database inside DB_BUDGET_MB. Runs from the janitor (and
+        after bursts of history inserts). Never raises."""
+        if self.db is None:
+            return
+        if not force and time.time() - self.db_checked < 600 and self._history_writes < 50:
+            return
+        self._history_writes = 0
+        try:
+            size, docs = await self.db_usage()
+            self.db_size_mb, self.db_job_docs, self.db_checked = size, docs, time.time()
+            if docs > DB_MAX_JOB_DOCS or size > DB_BUDGET_MB * 0.8:
+                await self.prune_jobs()
+            # still over budget → shrink aggressively, halving the job cap each pass
+            keep = DB_MAX_JOB_DOCS
+            while size > DB_BUDGET_MB and keep > 100:
+                keep //= 2
+                await self.prune_jobs(keep_docs=keep)
+                size, docs = await self.db_usage()
+            if size > DB_BUDGET_MB:
+                log.warning("MongoDB is %.1f MB (> budget %d MB) even after pruning — check the Atlas dashboard",
+                            size, DB_BUDGET_MB)
+            self.db_size_mb, self.db_job_docs = size, docs
+        except Exception as e:
+            log.warning("budget check failed: %s", e)
+
+    def budget_info(self) -> dict:
+        pct = round(100 * self.db_size_mb / DB_BUDGET_MB, 1) if DB_BUDGET_MB else 0
+        return {"size_mb": self.db_size_mb, "budget_mb": DB_BUDGET_MB, "percent": pct,
+                "job_docs": self.db_job_docs, "max_job_docs": DB_MAX_JOB_DOCS,
+                "ttl_days": DB_JOB_TTL_DAYS, "pruned": self.db_pruned_total,
+                "checked": int(self.db_checked)}
 
     # ── persistence helpers (fire-and-forget) ──────────────────────────
     def _save_user(self, uid: int) -> None:
@@ -462,7 +591,10 @@ class Store:
         entry = {"uid": uid, "ts": int(time.time()), **entry}
         dq = self.history.setdefault(uid, deque(maxlen=HISTORY_LIMIT))
         dq.appendleft(entry)
-        snapshot = dict(entry)
+        snapshot = {k: v for k, v in entry.items() if k != "error" or v}
+        if isinstance(snapshot.get("error"), str):
+            snapshot["error"] = snapshot["error"][:200]      # keep job docs tiny
+        self._history_writes += 1
         self._enqueue(lambda: self.db.jobs.insert_one(dict(snapshot)))
 
     def user_history(self, uid: int, limit: int = 20) -> List[dict]:
@@ -1252,6 +1384,8 @@ async def janitor():
     while not SHUTTING_DOWN:
         await asyncio.sleep(300)
         now = time.time()
+        if store.connected:
+            await store.check_budget()
         for jid, job in list(PENDING.items()):
             if now - job.created > PENDING_TTL:
                 job.cleanup()
@@ -1780,7 +1914,9 @@ def text_owner() -> str:
         "/links – admin invite links\n"
         "/stats – this panel\n"
         f"{DIV}\n"
-        + (f"<i>🗄 MongoDB connected ({esc(MONGO_DB)}) — users, settings\nand history are persistent.</i>"
+        + (f"<i>🗄 MongoDB connected ({esc(MONGO_DB)}) — users, settings\nand history are persistent.</i>\n"
+           f"<i>💾 Storage: {store.db_size_mb:.1f} / {DB_BUDGET_MB} MB ({store.budget_info()['percent']}%)"
+           f" · {fmt_int(store.db_job_docs)} job docs · TTL {DB_JOB_TTL_DAYS} d</i>"
            if store.connected else
            "<i>⚠️ No database: users added at runtime are lost on\n"
            "restart. Put permanent IDs in AUTHORIZED_USERS env.</i>")
@@ -2482,7 +2618,8 @@ async def api_admin_overview(request: web.Request) -> web.Response:
                   "users": users, "chats": len(store.chats), "recent": store.recent_history(30),
                   "active": _job_public(ACTIVE, tg["id"]) if ACTIVE else None,
                   "queue_len": len(QUEUE), "pending_len": len(PENDING),
-                  "db": store.connected, "public_mode": PUBLIC_MODE,
+                  "db": store.connected, "db_budget": store.budget_info() if store.connected else None,
+                  "public_mode": PUBLIC_MODE,
                   "backup_group": BACKUP_GROUP_ID, "security_code_set": bool(store.security_code)})
 
 async def api_admin_users(request: web.Request) -> web.Response:
@@ -2590,6 +2727,8 @@ async def health(_request: web.Request) -> web.Response:
         "version": "4.0",
         "uptime_sec": int(time.time() - store.booted),
         "db": "mongodb" if store.connected else "memory",
+        "db_size_mb": store.db_size_mb if store.connected else 0,
+        "db_budget_mb": DB_BUDGET_MB if store.connected else 0,
         "mini_app": bool(MINI_APP_URL),
         "users": len(store.users),
         "active": ACTIVE.novel_name if ACTIVE else None,
