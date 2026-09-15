@@ -6,9 +6,14 @@ A single-file Telegram bot (Pyrogram + aiohttp) that translates whole
 documents (EPUB / TXT / DOCX / PDF) into 25 languages and delivers the result
 as TXT, DOCX or EPUB — split into parts of any size you like.
 
-> 🗄 **Optional MongoDB persistence.** Set `MONGO_URI` (MongoDB Atlas free tier
-> is enough) and users, settings, stats, security code and job history survive
-> every deploy. Without it the bot falls back to the old fully-in-RAM behaviour.
+> 🗄 **MongoDB persistence out of the box.** The bot ships with the project's own
+> MongoDB Atlas free-tier (M0, 512 MB) connection string baked in, so users, settings,
+> stats, security code and job history survive every deploy with zero setup.
+> Set `MONGO_URI` to use your own cluster, or `MONGO_URI=off` for the old fully-in-RAM mode.
+>
+> 💾 **Free-tier safe.** Only *metadata* is stored — uploaded / translated files never
+> touch the database. A built-in storage guard (`DB_BUDGET_MB`, default 400 MB) prunes
+> old job history (per-user cap → global cap → TTL) so the M0 tier can never fill up.
 >
 > 📱 **Telegram Mini App.** The same process serves a premium dashboard at
 > `/app` — settings, live job progress, history and an owner panel — opened
@@ -29,7 +34,8 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
   (per-chat `BotCommandScope`, so each person sees exactly the commands they can use)
 - **Security-code gate**, owner panel, `/adduser`, `/deluser`, `/broadcast`, `/setcode`, `/id`
 - **Optional backup group** – each job gets its own forum topic with all delivered parts (set `BACKUP_GROUP_ID=0` to disable)
-- **MongoDB persistence (optional)** – write-through RAM cache + background writer (`motor`), so handlers never block on the DB. Collections: `users`, `stats`, `jobs` (90-day TTL history), `chats`, `meta`
+- **MongoDB persistence (optional)** – write-through RAM cache + background writer (`motor`), so handlers never block on the DB. Collections: `users`, `stats`, `jobs` (TTL history, `DB_JOB_TTL_DAYS`), `chats`, `meta`.
+  **Storage guard**: every 10 min (and after bursts of jobs) the janitor reads `dbStats`; if the DB exceeds 80 % of `DB_BUDGET_MB` or `jobs` exceeds `DB_MAX_JOB_DOCS`, old history is pruned (per-user `HISTORY_LIMIT` → global cap → halve cap until under budget). Usage is shown in `/stats`, the Mini App owner panel and `/health`
 - **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🔒 unlock with security code, 👑 owner panel (users add/remove, broadcast, change code, global stats). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
 - **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
@@ -49,8 +55,9 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
    | `SECURITY_CODE` | any secret ≥ 6 chars users must send to unlock the bot      |
    | `OWNER_ID`      | your numeric Telegram ID (send `/id` to the bot, or @userinfobot) |
 
-   Optional but recommended: `MONGO_URI` → a free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
+   Optional: `MONGO_URI` → your own free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
    connection string (`mongodb+srv://…`). Allow access from `0.0.0.0/0` in Atlas Network Access.
+   Leave it empty to use the built-in project cluster, or set `MONGO_URI=off` for RAM-only.
 
 4. Deploy. Open the service URL → you should see “Telegram bot is online”.
 5. Send `/start` to your bot. The **📱 App** menu button and the *📱 Mini App* keyboard
@@ -60,8 +67,8 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 > - The instance is spun down after 15 min without HTTP traffic. The built-in
 >   keep-alive pings `RENDER_EXTERNAL_URL/health` every 10 min to prevent that
 >   (`KEEP_ALIVE=0` to disable). Free tier also has a monthly hour budget.
-> - Without `MONGO_URI` every deploy/restart wipes memory: users authorised with the code or
->   `/adduser` must re-send the code. Put permanent IDs in `AUTHORIZED_USERS` — or just add MongoDB.
+> - With `MONGO_URI=off` every deploy/restart wipes memory: users authorised with the code or
+>   `/adduser` must re-send the code. Put permanent IDs in `AUTHORIZED_USERS` — or keep MongoDB on.
 > - Set `OWNER_ID` explicitly; otherwise the first person who sends the code
 >   after each restart becomes the owner.
 
@@ -74,9 +81,12 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 | `OWNER_ID`           | `0`     | Permanent owner. `0` → first unlocked user becomes owner       |
 | `AUTHORIZED_USERS`   | —       | Comma-separated IDs pre-authorised on every start             |
 | `PUBLIC_MODE`        | `0`     | `1` → anyone can use the bot, no code needed                  |
-| `MONGO_URI`          | —       | MongoDB connection string. Empty → in-memory only              |
+| `MONGO_URI`          | built-in Atlas M0 | MongoDB connection string. `off` → in-memory only      |
 | `MONGO_DB`           | `noveltranslator` | Database name                                        |
 | `HISTORY_LIMIT`      | `30`    | Jobs kept per user in history (5–100)                          |
+| `DB_BUDGET_MB`       | `400`   | Storage budget (50–512). Above 80 % → old history is pruned    |
+| `DB_MAX_JOB_DOCS`    | `3000`  | Global cap for the `jobs` collection                           |
+| `DB_JOB_TTL_DAYS`    | `60`    | Job history expiry via MongoDB TTL index (7–365)               |
 | `PUBLIC_URL`         | `RENDER_EXTERNAL_URL` | Public HTTPS base URL (needed for the Mini App)  |
 | `MINI_APP_URL`       | `PUBLIC_URL/app` | Override the Mini App URL                               |
 | `MINIAPP_DEV_USER`   | `0`     | Local dev only: fake Telegram user id for `http://localhost/app` |

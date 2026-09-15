@@ -195,6 +195,13 @@
       $("a-users").textContent = fmtInt(a.users.length); $("a-jobs").textContent = fmtInt(a.stats.jobs);
       $("a-uptime").textContent = fmtUptime(a.uptime); $("a-parts").textContent = fmtInt(a.stats.parts);
       $("a-failed").textContent = fmtInt(a.stats.failed); $("a-cancel").textContent = fmtInt(a.stats.cancelled);
+      const bud = a.db_budget; $("db-card").classList.toggle("hidden", !bud);
+      if (bud) {
+        const pct = Math.min(100, bud.percent || 0);
+        $("db-bar").style.width = pct + "%"; $("db-bar").style.background = pct > 85 ? "var(--danger, #ef4444)" : "";
+        $("db-size").textContent = `${(bud.size_mb || 0).toFixed(1)} / ${bud.budget_mb} MB (${pct}%)`;
+        $("db-docs").textContent = `${fmtInt(bud.job_docs)} / ${fmtInt(bud.max_job_docs)} job docs · TTL ${bud.ttl_days} d${bud.pruned ? " · pruned " + fmtInt(bud.pruned) : ""}`;
+      }
       $("admin-users").innerHTML = a.users.map((u) => `<div class="user">
           <div><div class="u-name">${esc(u.name)} ${u.role === "owner" ? "👑" : ""}</div>
           <div class="u-meta">ID ${u.id} · ${langLabel(u.lang)} · ${fmtInt(u.stats?.jobs || 0)} jobs · seen ${fmtAgo(u.last_seen)}</div></div>
