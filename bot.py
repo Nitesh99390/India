@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║        📚 NovelTranslator PRO  —  Telegram Document Translation Bot       ║
-║      v5.0  ·  Approval system + Admins · MongoDB + Mini App · Render     ║
+║      v6.0  ·  Master + Workers · GridFS + Mini App · Render              ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  • Approval-based access (no password) → users request, owner/admins    ║
 ║    approve for 1 week / month / year / lifetime / custom; auto-expiry,  ║
@@ -23,6 +23,7 @@ import calendar
 import hashlib
 import hmac
 import html
+import io
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ import ebooklib
 from aiohttp import web
 from bs4 import BeautifulSoup
 from ebooklib import epub
+from database import job_repo_from_store
 
 # Pyrogram still calls asyncio.get_event_loop() at import/Client-init time.
 # On Python ≥ 3.12 that is deprecated (and fails on 3.14) when no loop exists,
@@ -135,7 +137,7 @@ LEGACY_USERS = _env("LEGACY_USERS", "keep").lower()        # v4 users unlocked w
 AUDIT_LIMIT = 300                                          # audit entries kept in RAM / DB
 
 BOT_NAME = _env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "5.0"
+VERSION = "6.0-master-worker"
 CONCURRENCY_LIMIT = max(1, min(_env_int("CONCURRENCY", 8), 20))
 CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3500), 4800))
 MAX_RETRIES = 5
@@ -1002,6 +1004,7 @@ class Store:
 
 MemoryStore = Store          # backwards-compatible alias
 store = Store()
+QUEUE_REPO = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1729,6 +1732,7 @@ class Job:
     msg: Optional[Message] = None
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     progress: dict = field(default_factory=dict)      # live info for the Mini App
+    gridfs_id: str = ""                                  # source file stored in MongoDB GridFS
 
     @property
     def lang_name(self) -> str:
@@ -1788,7 +1792,17 @@ def cancel_kb(job: Job) -> InlineKeyboardMarkup:
 async def enqueue(job: Job, message: Message):
     job.msg = message
     job.status = "queued"
-    QUEUE.append(job)
+    if QUEUE_REPO and job.gridfs_id:
+        await QUEUE_REPO.enqueue_job({
+            "job_id": job.job_id, "file_id": job.gridfs_id, "chat_id": job.chat_id,
+            "user_id": job.user_id, "user_name": job.user_name, "name": job.novel_name,
+            "size": job.file_size, "ext": job.ext, "lang": job.lang, "fmt": job.out_format,
+            "split_kb": job.split_kb,
+        })
+    else:
+        # RAM-only mode is kept for the offline Mini App harness. Production
+        # master/worker deployments require MongoDB so jobs survive restarts.
+        QUEUE.append(job)
     await LiveMessage(message).update(queued_text(job, queue_position(job)), cancel_kb(job), force=True)
     if QUEUE_WAKE:
         QUEUE_WAKE.set()
@@ -3059,7 +3073,7 @@ async def handle_document(_, m: Message):
               user_name=m.from_user.first_name or "User", file_path="", ext=ext,
               novel_name=novel_name, file_size=doc.file_size or 0,
               lang=lang, out_format=fmt, split_kb=split)
-    job.file_path = os.path.join(INBOX_DIR, f"src_{job.job_id}{ext}")
+    job.file_path = ""
 
     status = await m.reply(header("Downloading", "📥") + f"📘 {b(novel_name)}\n{progress_bar(0)} 0%")
     live = LiveMessage(status, min_interval=3.0)
@@ -3070,9 +3084,17 @@ async def handle_document(_, m: Message):
                           f"{fmt_size(current)} / {fmt_size(total)}")
 
     try:
-        path = await m.download(file_name=job.file_path, progress=dl_progress)
-        if not path or not os.path.exists(job.file_path):
+        if not QUEUE_REPO or not QUEUE_REPO.files:
+            raise RuntimeError("MongoDB GridFS is required for document uploads")
+        stream = await m.download(in_memory=True, progress=dl_progress)
+        if not stream:
             raise RuntimeError("download returned no file")
+        content = stream.getvalue() if hasattr(stream, "getvalue") else bytes(stream)
+        job.gridfs_id = await QUEUE_REPO.upload_bytes(file_name, content, {
+            "job_id": job.job_id, "user_id": uid, "content_type": ext,
+        }) or ""
+        if not job.gridfs_id:
+            raise RuntimeError("GridFS upload failed")
     except Exception as e:
         log.warning("download failed: %s", e)
         job.cleanup()
@@ -3527,6 +3549,21 @@ def _job_public(j: Job, uid: int, position: int = 0) -> dict:
                      "phase": j.progress.get("phase", "")},
     }
 
+def _job_public_doc(job: Optional[dict], uid: int, position: int = 0) -> Optional[dict]:
+    """Serialize a MongoDB jobs_queue document for the Mini App."""
+    if not job:
+        return None
+    progress = job.get("progress") or {}
+    return {
+        "job_id": str(job.get("job_id", job.get("_id", ""))),
+        "name": job.get("name", "Document"), "size": int(job.get("size", 0) or 0),
+        "ext": job.get("ext", ".txt"), "lang": job.get("lang", DEFAULT_LANG),
+        "fmt": job.get("fmt", DEFAULT_FORMAT), "split": int(job.get("split_kb", 0) or 0),
+        "status": job.get("status", "queued"), "mine": int(job.get("user_id", 0)) == uid,
+        "user": job.get("user_name", "") if store.is_owner(uid) else "", "position": position,
+        "created": int(job.get("created_at", time.time())), "progress": progress,
+    }
+
 def _config_public() -> dict:
     return {
         "bot": BOT_NAME, "username": BOT_USERNAME, "public_mode": PUBLIC_MODE,
@@ -3702,10 +3739,16 @@ async def api_jobs(request: web.Request) -> web.Response:
     owner = store.is_owner(uid)
     active = _job_public(ACTIVE, uid) if ACTIVE else None
     queue = [_job_public(j, uid, i) for i, j in enumerate(QUEUE, 1)]
+    persisted = await QUEUE_REPO.list_user_jobs(uid, owner=owner) if QUEUE_REPO else []
+    if persisted:
+        active_doc = next((j for j in persisted if j.get("status") == "running"), None)
+        active = _job_public_doc(active_doc, uid) if active_doc else active
+        queue = [_job_public_doc(j, uid, index) for index, j in enumerate(
+            [j for j in persisted if j.get("status") == "queued"], 1)]
     pending = [_job_public(j, uid) for j in PENDING.values() if j.user_id == uid]
     history = store.user_history(uid, 25)
     return _json({"ok": True, "active": active, "queue": queue, "pending": pending, "history": history,
-                  "queue_len": len(QUEUE), "global": store.stats if owner else None,
+                  "queue_len": len(queue), "global": store.stats if owner else None,
                   "server_time": int(time.time()), "shutting_down": SHUTTING_DOWN})
 
 async def api_job_start(request: web.Request) -> web.Response:
@@ -3752,6 +3795,8 @@ async def api_job_cancel(request: web.Request) -> web.Response:
     target = str(body.get("job_id", "") or "")
     owner = store.is_owner(uid)
     n = 0
+    if QUEUE_REPO and target:
+        n += int(await QUEUE_REPO.cancel_job(target, uid, owner=owner))
     if ACTIVE and (not target or ACTIVE.job_id == target) and (ACTIVE.user_id == uid or owner):
         ACTIVE.cancel.set(); n += 1
     for j in [j for j in QUEUE if (not target or j.job_id == target) and (j.user_id == uid or owner)]:
@@ -3783,6 +3828,7 @@ async def api_admin_overview(request: web.Request) -> web.Response:
     owner = store.is_owner(tg["id"])
     users = [_user_public(uid, u) for uid, u in store.users.items()]
     users.sort(key=lambda x: (_STATUS_ORDER.get(x["access"]["status"], 9), -x["last_seen"]))
+    workers = await QUEUE_REPO.workers() if QUEUE_REPO else []
     return _json({"ok": True, "stats": store.stats, "uptime": int(time.time() - store.booted),
                   "users": users, "counts": store.count_by_status(),
                   "pending": [_user_public(uid, u) for uid, u in store.pending_users()],
@@ -3793,7 +3839,9 @@ async def api_admin_overview(request: web.Request) -> web.Response:
                   "queue_len": len(QUEUE), "pending_len": len(PENDING),
                   "db": store.connected, "db_budget": store.budget_info() if store.connected else None,
                   "public_mode": PUBLIC_MODE, "backup_group": BACKUP_GROUP_ID,
-                  "env_admins": ADMIN_USERS, "env_users": AUTHORIZED_USERS})
+                  "env_admins": ADMIN_USERS, "env_users": AUTHORIZED_USERS,
+                  "workers": workers, "worker_count": len(workers),
+                  "workers_online": sum(1 for worker in workers if worker.get("status") != "offline")})
 
 async def api_admin_user(request: web.Request) -> web.Response:
     tg, err = _require_admin(request)
@@ -3944,6 +3992,8 @@ async def miniapp_file(request: web.Request) -> web.Response:
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok" if not SHUTTING_DOWN else "shutting_down",
+        "role": "master",
+        "polling": True,
         "bot": BOT_USERNAME,
         "version": VERSION,
         "uptime_sec": int(time.time() - store.booted),
@@ -4042,10 +4092,11 @@ async def shutdown_jobs():
         QUEUE_WAKE.set()
 
 async def main():
-    global QUEUE_WAKE, BOT_USERNAME
+    global QUEUE_WAKE, BOT_USERNAME, QUEUE_REPO
     QUEUE_WAKE = asyncio.Event()
     runner = await start_health_server()          # bind the port FIRST → Render sees us healthy
-    await store.connect()                         # MongoDB (optional) → loads users / stats / history
+    await store.connect()                         # MongoDB → users, GridFS and shared jobs_queue
+    QUEUE_REPO = job_repo_from_store(store)
 
     for attempt in range(1, 6):
         try:
@@ -4077,8 +4128,7 @@ async def main():
             await app.set_chat_menu_button(menu_button=MenuButtonWebApp("📱 App", WebAppInfo(url=MINI_APP_URL)))
         except Exception as e:
             log.debug("set_chat_menu_button: %s", e)
-    tasks = [asyncio.create_task(queue_worker(), name="queue_worker"),
-             asyncio.create_task(janitor(), name="janitor"),
+    tasks = [asyncio.create_task(janitor(), name="janitor"),
              asyncio.create_task(keep_alive(), name="keep_alive")]
     log.info("%s online as @%s | owner=%s | users=%d | public=%s | pdf=%s | db=%s | app=%s | port=%d",
              BOT_NAME, me.username, store.owner_id or "none", len(store.users), PUBLIC_MODE, HAS_PDF,

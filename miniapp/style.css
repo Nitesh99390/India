@@ -319,3 +319,11 @@ label { display: block; font-size: .76rem; font-weight: 600; letter-spacing: .02
 .audit b { color: var(--text); font-weight: 600; }
 .hist-line { font-size: .78rem; color: var(--hint); padding: 2px 0; }
 #adduser-form select { flex: 0 0 auto; width: auto; }
+.worker-nodes { display: flex; flex-direction: column; gap: 4px; }
+.worker-node { display: flex; align-items: center; gap: 9px; padding: 8px 0; border-top: 1px solid color-mix(in srgb, var(--hint) 15%, transparent); }
+.worker-node:first-child { border-top: 0; }
+.worker-node > div:nth-child(2) { flex: 1; min-width: 0; }
+.worker-node b { font-size: .86rem; }
+.worker-dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: var(--hint); box-shadow: 0 0 0 4px color-mix(in srgb, var(--hint) 12%, transparent); }
+.worker-dot.on { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 15%, transparent); }
+.worker-dot.idle { background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 15%, transparent); }

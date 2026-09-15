@@ -322,6 +322,13 @@
       $("db-size").textContent = `${(bud.size_mb || 0).toFixed(1)} / ${bud.budget_mb} MB (${pct}%)`;
       $("db-docs").textContent = `${fmtInt(bud.job_docs)} / ${fmtInt(bud.max_job_docs)} job docs · TTL ${bud.ttl_days} d${bud.pruned ? " · pruned " + fmtInt(bud.pruned) : ""}`;
     }
+    const workers = a.workers || [];
+    $("worker-count").textContent = `${a.workers_online || 0} online`;
+    $("worker-nodes").innerHTML = workers.length ? workers.map((worker) => {
+      const lastSeen = worker.last_seen ? fmtAgo(worker.last_seen) : "never";
+      const current = worker.current_job ? `Translating ${esc(worker.current_job)}` : "Waiting for a job";
+      return `<div class="worker-node"><span class="worker-dot ${worker.status === "idle" ? "idle" : "on"}"></span><div><b>${esc(worker.node_id || "Worker")}</b><div class="tiny muted">${esc(current)} · heartbeat ${esc(lastSeen)}</div></div><span class="st ${worker.status === "idle" ? "approved" : "pending"}">${esc(worker.status || "unknown")}</span></div>`;
+    }).join("") : `<p class="muted small">No active worker nodes. Start a Render worker service to process queued jobs.</p>`;
     const pending = a.pending || [];
     setNum("a-pending", pending.length);
     $("admin-pending").innerHTML = pending.length ? pending.map(reqRow).join("") : `<p class="muted small">No pending requests. 🎉</p>`;

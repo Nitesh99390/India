@@ -1,15 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render Blueprint — NovelTranslator PRO v4 (free tier · MongoDB + Mini App)
+#  Render Blueprint — NovelTranslator PRO v6 (master + worker · MongoDB GridFS)
 #  Dashboard → New → Blueprint → pick this repo → fill the secret env vars.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
-  - type: web                      # "web" (not worker) so the free tier applies
-    name: noveltranslator-bot
+  - type: web
+    name: noveltranslator-master
     runtime: python
     plan: free
     region: singapore              # closest to India; change if you like
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python master.py
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -44,6 +44,8 @@ services:
         sync: false
       - key: MONGO_DB
         value: noveltranslator
+      - key: SERVICE_ROLE
+        value: master
       # Free-tier storage guard (Atlas M0 = 512 MB): prune old job history above 80 % of the budget
       - key: DB_BUDGET_MB
         value: "400"
@@ -68,3 +70,36 @@ services:
         value: "1"
       - key: KEEP_ALIVE_INTERVAL   # seconds (free tier sleeps after 15 min idle)
         value: "600"
+
+  - type: web
+    name: noveltranslator-worker
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python worker.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: noveltranslator
+      - key: SERVICE_ROLE
+        value: worker
+      - key: WORKER_NODE_ID
+        generateValue: true
+      - key: WORKER_HEARTBEAT_INTERVAL
+        value: "30"
+      - key: WORKER_POLL_INTERVAL
+        value: "3"

@@ -6,8 +6,8 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PORT=10000
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY config.py database.py translator.py master.py worker.py bot.py .
 COPY miniapp ./miniapp
 
 EXPOSE 10000
-CMD ["python", "bot.py"]
+CMD ["python", "master.py"]

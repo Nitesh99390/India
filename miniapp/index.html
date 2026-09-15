@@ -209,6 +209,14 @@
             <p class="muted small" id="db-note">Only metadata is stored (users · settings · counters · job history). Files never touch the database.</p>
           </div>
 
+          <div class="card accent" id="workers-card">
+            <div class="card-title">🖥 Server Nodes <span id="worker-count" class="chip">0 online</span></div>
+            <p class="muted small" id="workers-note">Workers claim queued translations atomically so multiple Render instances can run safely.</p>
+            <div id="worker-nodes" class="worker-nodes">
+              <p class="muted small">No worker heartbeat received yet.</p>
+            </div>
+          </div>
+
           <div class="card accent" id="pending-req-card">
             <div class="card-title">⏳ Access requests <span id="a-pending" class="chip">–</span></div>
             <div id="admin-pending" class="skel-host"><div class="skel-job"><div class="skel line" style="width:55%"></div><div class="skel line sm" style="width:80%"></div></div></div>
