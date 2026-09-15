@@ -50,7 +50,8 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 - **MongoDB persistence (optional)** – write-through RAM cache + background writer (`motor`), so handlers never block on the DB. Collections: `users`, `stats`, `jobs` (TTL history, `DB_JOB_TTL_DAYS`), `chats`, `meta`.
   **Storage guard**: every 10 min (and after bursts of jobs) the janitor reads `dbStats`; if the DB exceeds 80 % of `DB_BUDGET_MB` or `jobs` exceeds `DB_MAX_JOB_DOCS`, old history is pruned (per-user `HISTORY_LIMIT` → global cap → halve cap until under budget). Usage is shown in `/stats`, the Mini App owner panel and `/health`
 - **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🎫 my access card + expiry banner, 🔒 locked screen with **Request Access** / pending status / withdraw (auto re-checks while pending), 👑 admin panel (pending requests with one-tap plans, user list with status filters, per-user sheet: approve / extend / custom duration / reject / revoke / ban / unban / promote, audit log, broadcast). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
-- **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus
+- **Mini App UX polish** – skeleton shimmer while loading (no blank splash), ↻ refresh button + pull-to-refresh gesture (`disableVerticalSwipes` so Telegram doesn't collapse the app), animated tab slides / staggered card entrances / number bumps, slide-up bottom sheets with grabber, and rich haptics (`HapticFeedback` impact / selection / notification, `navigator.vibrate` fallback outside Telegram). Honours `prefers-reduced-motion`
+- **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus. The *📱 Mini App* keyboard button behaves like `/app`: the bot replies with a message carrying an inline **📱 Open Mini App** button (fresh link, visible in chat)
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
 
 ## 🚀 Deploy on Render (free)
@@ -72,8 +73,9 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
    Leave it empty to use the built-in project cluster, or set `MONGO_URI=off` for RAM-only.
 
 4. Deploy. Open the service URL → you should see “Telegram bot is online”.
-5. Send `/start` to your bot. The **📱 App** menu button and the *📱 Mini App* keyboard
-   button open the dashboard (`RENDER_EXTERNAL_URL/app` is wired automatically). 🎉
+5. Send `/start` to your bot. The **📱 App** menu button opens the dashboard directly and the
+   *📱 Mini App* keyboard button (or `/app`) sends an inline **Open Mini App** link
+   (`RENDER_EXTERNAL_URL/app` is wired automatically). 🎉
 
 > ⚠️ Free-tier notes
 > - The instance is spun down after 15 min without HTTP traffic. The built-in

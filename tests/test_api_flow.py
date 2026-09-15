@@ -2,11 +2,13 @@
 """End-to-end check of the v5 Mini App API against a running dev harness.
 
     tests/devctl.sh start owner 8080
-    python tests/test_api_flow.py 8080
+    tests/devctl.sh start locked 8081        # optional, for the locked-user flow
+    python tests/test_api_flow.py 8080 [8081]
 
 Runs as the dev owner (MINIAPP_DEV_USER) and exercises the admin endpoints:
 approve / extend / reject / revoke / ban / unban / promote / demote plus
-the user-facing access endpoints on a second, locked harness if port+1 is up.
+the user-facing access endpoints on a second, locked harness (second argument,
+default port+1) if it is up — otherwise that part is skipped.
 """
 import json
 import sys
@@ -14,6 +16,7 @@ import urllib.request
 import urllib.error
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+LOCKED_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else PORT + 1
 BASE = f"http://localhost:{PORT}"
 fails = 0
 
@@ -30,6 +33,8 @@ def call(path, body=None, base=BASE):
             return e.code, json.loads(e.read() or b"{}")
         except Exception:
             return e.code, {}
+    except (urllib.error.URLError, OSError) as e:       # harness not running / refused
+        return 0, {"error": str(e)}
 
 
 def check(name, cond, info=""):
@@ -99,10 +104,10 @@ s, r = call("/api/admin/users", {"action": "remove", "id": 555001})
 check("legacy remove → revoke", s == 200 and r["user"]["access"]["status"] == "none")
 
 # ── locked user flow on the neighbour harness (DEV_ROLE=locked) ────────
-LOCKED = f"http://localhost:{PORT + 3}"
+LOCKED = f"http://localhost:{LOCKED_PORT}"
 s, r = call("/api/me", base=LOCKED)
 if s == 0 or s >= 500 or (s == 200 and r.get("me", {}).get("owner")):
-    print("ℹ️  locked harness not running on", LOCKED, "— skipping user flow (tests/devctl.sh start locked", PORT + 3, ")")
+    print("ℹ️  locked harness not running on", LOCKED, "— skipping user flow (tests/devctl.sh start locked", LOCKED_PORT, ")")
 else:
     check("locked /api/me → 403 code=locked", s == 403 and r.get("code") == "locked" and r.get("me"), r.get("status"))
     check("locked payload has access", r["me"]["access"]["can_request"] is True)

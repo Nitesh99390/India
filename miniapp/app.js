@@ -10,17 +10,43 @@
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   const state = { me: null, config: null, jobs: null, admin: null, tab: "home", timer: null, sheetJob: null,
-                  filter: "all", sheetUser: null, lockedTimer: null };
+                  filter: "all", sheetUser: null, lockedTimer: null, refreshing: false };
+  const TAB_ORDER = ["home", "settings", "history", "admin"];
 
   // ── Telegram bootstrap ────────────────────────────────────────────────
   if (tg) {
     try { tg.ready(); tg.expand(); } catch (_) {}
     try { tg.setHeaderColor && tg.setHeaderColor("secondary_bg_color"); } catch (_) {}
     try { tg.disableClosingConfirmation && tg.disableClosingConfirmation(); } catch (_) {}
+    // Our own pull-to-refresh gesture must not collapse/close the Mini App (Bot API 7.7+)
+    try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch (_) {}
   }
-  const haptic = (t) => { try { tg && tg.HapticFeedback && (t === "err" ? tg.HapticFeedback.notificationOccurred("error")
-    : t === "ok" ? tg.HapticFeedback.notificationOccurred("success") : tg.HapticFeedback.impactOccurred("light")); } catch (_) {} };
-  const ask = (msg) => tg && tg.showConfirm ? new Promise((r) => tg.showConfirm(msg, r)) : Promise.resolve(confirm(msg));
+
+  // ── Haptic feedback ──
+  //   haptic()            light tap (default)      haptic("medium"|"heavy"|"rigid"|"soft")
+  //   haptic("select")    selection changed        haptic("ok") / haptic("warn") / haptic("err")
+  // Falls back to navigator.vibrate() when opened outside Telegram (Android browsers).
+  const HF = tg && tg.HapticFeedback;
+  let lastHaptic = 0;
+  function haptic(t) {
+    const now = Date.now(); if (now - lastHaptic < 35) return; lastHaptic = now;     // debounce bursts
+    try {
+      if (HF) {
+        if (t === "ok" || t === "err" || t === "warn") HF.notificationOccurred({ ok: "success", err: "error", warn: "warning" }[t]);
+        else if (t === "select") HF.selectionChanged();
+        else HF.impactOccurred(t && ["light", "medium", "heavy", "rigid", "soft"].includes(t) ? t : "light");
+      } else if (navigator.vibrate) {
+        navigator.vibrate(t === "err" ? [30, 40, 30] : t === "ok" ? [10, 30, 20] : t === "heavy" || t === "medium" ? 18 : 8);
+      }
+    } catch (_) {}
+  }
+  // Every tappable control gives a tiny tick the moment the finger lands on it
+  document.addEventListener("pointerdown", (ev) => {
+    const el = ev.target.closest(".btn, .choice, .nav, .iconbtn, .x, .user, .filters button, select");
+    if (!el || el.disabled) return;
+    haptic(el.classList.contains("choice") || el.classList.contains("nav") ? "select" : el.classList.contains("danger") ? "medium" : "light");
+  }, { passive: true });
+  const ask = (msg) => { haptic("warn"); return tg && tg.showConfirm ? new Promise((r) => tg.showConfirm(msg, r)) : Promise.resolve(confirm(msg)); };
 
   // ── API helper ────────────────────────────────────────────────────────
   async function api(path, opts = {}) {
@@ -38,13 +64,29 @@
   }
 
   // ── UI utils ──────────────────────────────────────────────────────────
-  function show(view) {
-    ["loading", "locked", "auth", "main"].forEach((v) => $("view-" + v).classList.toggle("hidden", v !== view));
+  // Re-run an entrance animation on an element by toggling a class
+  function animate(el, cls, ms = 600) {
+    if (!el) return; el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls);
+    clearTimeout(el._animT); el._animT = setTimeout(() => el.classList.remove(cls), ms);
   }
-  let toastTimer;
+  function show(view) {
+    const cur = ["loading", "locked", "auth", "main"].find((v) => !$("view-" + v).classList.contains("hidden"));
+    if (cur === view) return;
+    ["loading", "locked", "auth", "main"].forEach((v) => $("view-" + v).classList.toggle("hidden", v !== view));
+    animate($("view-" + view), "enter", 900);
+    window.scrollTo({ top: 0 });
+  }
+  let toastTimer, toastOutTimer;
   function toast(msg, kind) {
     const t = $("toast"); t.textContent = msg; t.className = "toast " + (kind || "");
-    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
+    void t.offsetWidth;                                   // restart the pop-in animation
+    clearTimeout(toastTimer); clearTimeout(toastOutTimer);
+    toastTimer = setTimeout(() => { t.classList.add("out"); toastOutTimer = setTimeout(() => t.classList.add("hidden"), 240); }, 2400);
+  }
+  // Update a number and "bump" it when the value actually changed
+  function setNum(id, val) {
+    const el = $(id); if (!el) return; const s = String(val);
+    if (el.textContent !== s) { el.textContent = s; if (el.dataset.ready) animate(el, "bump", 500); el.dataset.ready = "1"; }
   }
   const fmtInt = (n) => Number(n || 0).toLocaleString();
   const fmtSize = (n) => { n = Number(n || 0); const u = ["B", "KB", "MB", "GB"]; let i = 0;
@@ -76,7 +118,7 @@
     if (me.photo) { $("avatar").src = me.photo; $("avatar").classList.remove("hidden"); $("avatar-fallback").classList.add("hidden"); }
     const pill = $("db-pill"); pill.textContent = cfg.db ? "🗄 MongoDB" : "🧠 RAM"; pill.classList.toggle("on", !!cfg.db);
     pill.title = cfg.db ? "Persistent storage: " + cfg.db_name : "In-memory — settings reset on restart";
-    $("s-jobs").textContent = fmtInt(me.stats.jobs); $("s-parts").textContent = fmtInt(me.stats.parts); $("s-chars").textContent = fmtInt(me.stats.chars);
+    setNum("s-jobs", fmtInt(me.stats.jobs)); setNum("s-parts", fmtInt(me.stats.parts)); setNum("s-chars", fmtInt(me.stats.chars));
     $("nav-admin").classList.toggle("hidden", !isAdmin());
     document.querySelectorAll(".owner-only").forEach((el) => el.classList.toggle("hidden", !me.owner));
     $("pdf-ext").textContent = (cfg.input_exts || []).includes(".pdf") ? " / .pdf" : "";
@@ -124,11 +166,11 @@
     $("split-custom").value = cfg.split_presets.some((s) => s.kb === p.split) ? "" : p.split;
   }
   async function savePref(k, v) {
-    haptic();
     try {
       const body = {}; body[k] = k === "split" ? Number(v) : v;
       const r = await api("/api/settings", { method: "POST", body });
-      state.me = r.me; renderSettings(); toast("✅ Saved", "ok");
+      state.me = r.me; renderSettings(); toast("✅ Saved", "ok"); haptic("ok");
+      const on = document.querySelector(`.choice.on[data-k="${k}"]`); if (on) animate(on, "just-on", 400);
     } catch (e) { toast(e.message, "err"); haptic("err"); }
   }
   document.addEventListener("click", (ev) => {
@@ -157,7 +199,7 @@
     const d = state.jobs; if (!d) return;
     $("alert-shutdown").classList.toggle("hidden", !d.shutting_down);
     $("active-box").innerHTML = d.active ? jobRow(d.active) : `<p class="muted small">Nothing is running right now.</p>`;
-    $("queue-count").textContent = d.queue_len;
+    setNum("queue-count", d.queue_len);
     $("queue-list").innerHTML = d.queue.length ? d.queue.map((j) => jobRow(j)).join("") : `<p class="muted small">Queue is empty.</p>`;
     const pend = d.pending || [];
     $("pending-card").classList.toggle("hidden", !pend.length);
@@ -176,10 +218,9 @@
   document.addEventListener("click", async (ev) => {
     const c = ev.target.closest("[data-cancel]");
     if (c) {
-      haptic();
       if (!(await ask("Cancel this job?"))) return;
-      try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: c.dataset.cancel } }); toast("🛑 Cancelled"); refreshJobs(); }
-      catch (e) { toast(e.message, "err"); }
+      try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: c.dataset.cancel } }); toast("🛑 Cancelled"); haptic("ok"); refreshJobs(); }
+      catch (e) { toast(e.message, "err"); haptic("err"); }
     }
     const cfgBtn = ev.target.closest("[data-config]");
     if (cfgBtn) openSheet(cfgBtn.dataset.config);
@@ -198,18 +239,25 @@
     const presets = cfg.split_presets.slice();
     if (!presets.some((s) => s.kb === split)) presets.push({ kb: split, label: splitLabel(split) });
     $("sheet-split").innerHTML = presets.map((s) => `<option value="${s.kb}" ${s.kb === split ? "selected" : ""}>${esc(s.label)}</option>`).join("");
-    $("sheet").classList.remove("hidden");
+    openSheetEl("sheet");
     if (tg && tg.BackButton) { tg.BackButton.show(); tg.BackButton.onClick(closeSheet); }
   }
+  // Bottom sheets: animated open / close (slide up / slide down)
+  function openSheetEl(id) { const s = $(id); s.classList.remove("closing"); s.classList.remove("hidden"); haptic("medium"); }
+  function closeSheetEl(id) {
+    const s = $(id); if (s.classList.contains("hidden")) return;
+    s.classList.add("closing"); haptic("soft");
+    setTimeout(() => { s.classList.add("hidden"); s.classList.remove("closing"); }, 220);
+  }
   function closeSheet() {
-    $("sheet").classList.add("hidden"); state.sheetJob = null;
+    closeSheetEl("sheet"); state.sheetJob = null;
     if (tg && tg.BackButton) { tg.BackButton.hide(); tg.BackButton.offClick(closeSheet); }
     if (location.hash) history.replaceState(null, "", location.pathname);
   }
   $("sheet-close").onclick = closeSheet;
   $("sheet").addEventListener("click", (e) => { if (e.target === $("sheet")) closeSheet(); });
   $("sheet-start").onclick = async () => {
-    if (!state.sheetJob) return; haptic();
+    if (!state.sheetJob) return;
     $("sheet-start").disabled = true;
     try {
       await api("/api/jobs/start", { method: "POST", body: { job_id: state.sheetJob.job_id,
@@ -220,8 +268,8 @@
   };
   $("sheet-cancel").onclick = async () => {
     if (!state.sheetJob) return;
-    try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: state.sheetJob.job_id } }); toast("Upload discarded"); closeSheet(); refreshJobs(); }
-    catch (e) { toast(e.message, "err"); }
+    try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: state.sheetJob.job_id } }); toast("Upload discarded"); haptic("ok"); closeSheet(); refreshJobs(); }
+    catch (e) { toast(e.message, "err"); haptic("err"); }
   };
 
   // ── Admin: overview ───────────────────────────────────────────────────
@@ -264,9 +312,9 @@
   }
   function renderAdmin() {
     const a = state.admin; if (!a) return;
-    $("a-users").textContent = fmtInt(a.users.length); $("a-jobs").textContent = fmtInt(a.stats.jobs);
-    $("a-uptime").textContent = fmtUptime(a.uptime); $("a-parts").textContent = fmtInt(a.stats.parts);
-    $("a-failed").textContent = fmtInt(a.stats.failed); $("a-cancel").textContent = fmtInt(a.stats.cancelled);
+    setNum("a-users", fmtInt(a.users.length)); setNum("a-jobs", fmtInt(a.stats.jobs));
+    setNum("a-uptime", fmtUptime(a.uptime)); setNum("a-parts", fmtInt(a.stats.parts));
+    setNum("a-failed", fmtInt(a.stats.failed)); setNum("a-cancel", fmtInt(a.stats.cancelled));
     const bud = a.db_budget; $("db-card").classList.toggle("hidden", !bud);
     if (bud) {
       const pct = Math.min(100, bud.percent || 0);
@@ -275,7 +323,7 @@
       $("db-docs").textContent = `${fmtInt(bud.job_docs)} / ${fmtInt(bud.max_job_docs)} job docs · TTL ${bud.ttl_days} d${bud.pruned ? " · pruned " + fmtInt(bud.pruned) : ""}`;
     }
     const pending = a.pending || [];
-    $("a-pending").textContent = pending.length;
+    setNum("a-pending", pending.length);
     $("admin-pending").innerHTML = pending.length ? pending.map(reqRow).join("") : `<p class="muted small">No pending requests. 🎉</p>`;
     const c = a.counts || {};
     $("a-counts").textContent = `✅ ${c.approved || 0} · ⏳ ${c.pending || 0} · ⌛ ${c.expired || 0}`;
@@ -297,15 +345,15 @@
   $("user-filters").addEventListener("click", (ev) => {
     const b = ev.target.closest("[data-f]"); if (!b) return;
     ev.stopPropagation();
+    if (state.filter === b.dataset.f) return;
     state.filter = b.dataset.f;
     document.querySelectorAll("#user-filters .choice").forEach((x) => x.classList.toggle("on", x === b));
-    renderAdmin();
+    renderAdmin(); animate($("admin-users"), "enter-l", 400);
   }, true);
 
   // ── Admin: actions ────────────────────────────────────────────────────
   async function userAction(action, uid, extra = {}, confirmMsg) {
     if (confirmMsg && !(await ask(confirmMsg))) return false;
-    haptic();
     try {
       const r = await api("/api/admin/users", { method: "POST", body: { action, id: Number(uid), ...extra } });
       toast({ approve: "✅ Approved", extend: "⏱ Extended", reject: "❌ Rejected", revoke: "🔒 Revoked", ban: "🚫 Banned",
@@ -338,8 +386,8 @@
     const text = $("bc-text").value.trim(); if (!text) return;
     if (!(await ask("Send to all approved users?"))) return;
     $("bc-send").disabled = true;
-    try { const r = await api("/api/admin/broadcast", { method: "POST", body: { text } }); $("bc-text").value = ""; toast(`📣 Sending to ${r.recipients} users`, "ok"); }
-    catch (e) { toast(e.message, "err"); } finally { $("bc-send").disabled = false; }
+    try { const r = await api("/api/admin/broadcast", { method: "POST", body: { text } }); $("bc-text").value = ""; toast(`📣 Sending to ${r.recipients} users`, "ok"); haptic("ok"); }
+    catch (e) { toast(e.message, "err"); haptic("err"); } finally { $("bc-send").disabled = false; }
   };
 
   // ── Admin: user sheet ─────────────────────────────────────────────────
@@ -396,11 +444,11 @@
       acts.push(`<p class="muted small">Only the owner can moderate an admin.</p>`);
     }
     $("usheet-actions").innerHTML = acts.join("");
-    $("usheet").classList.remove("hidden");
+    if ($("usheet").classList.contains("hidden")) openSheetEl("usheet");
     if (tg && tg.BackButton) { tg.BackButton.show(); tg.BackButton.onClick(closeUserSheet); }
   }
   function closeUserSheet() {
-    $("usheet").classList.add("hidden"); state.sheetUser = null;
+    closeSheetEl("usheet"); state.sheetUser = null;
     if (tg && tg.BackButton) { tg.BackButton.hide(); tg.BackButton.offClick(closeUserSheet); }
   }
   $("usheet-close").onclick = closeUserSheet;
@@ -425,14 +473,23 @@
   };
 
   // ── Tabs ──────────────────────────────────────────────────────────────
-  function setTab(name) {
+  // Animated: the new tab slides in from the side it lives on in the bottom nav
+  function setTab(name, opts = {}) {
+    const prev = state.tab;
+    if (prev === name && !opts.force) { window.scrollTo({ top: 0, behavior: "smooth" }); return; }
     state.tab = name;
-    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("hidden", t.id !== "tab-" + name));
+    const dir = TAB_ORDER.indexOf(name) >= TAB_ORDER.indexOf(prev) ? "enter-l" : "enter-r";
+    document.querySelectorAll(".tab").forEach((t) => {
+      const on = t.id === "tab-" + name;
+      t.classList.remove("enter-l", "enter-r");
+      t.classList.toggle("hidden", !on);
+      if (on) animate(t, dir, 700);
+    });
     document.querySelectorAll(".nav").forEach((n) => n.classList.toggle("active", n.dataset.tab === name));
     if (name === "admin") refreshAdmin();
     window.scrollTo({ top: 0 });
   }
-  document.querySelectorAll(".nav").forEach((n) => n.onclick = () => { haptic(); setTab(n.dataset.tab); });
+  document.querySelectorAll(".nav").forEach((n) => n.onclick = () => setTab(n.dataset.tab));
 
   // ── Polling ───────────────────────────────────────────────────────────
   async function refreshJobs() {
@@ -451,6 +508,59 @@
     if (state.me && !$("view-main").classList.contains("hidden")) { refreshJobs(); refreshMe(); }
     else if (!$("view-locked").classList.contains("hidden")) recheckAccess();
   });
+
+  // ── Manual refresh: ↻ button + pull-to-refresh ──
+  async function refreshAll(source) {
+    if (state.refreshing) return; state.refreshing = true;
+    const btn = $("btn-refresh"), ptr = $("ptr");
+    btn.classList.add("spin"); if (source === "pull") ptr.className = "ptr loading";
+    const t0 = Date.now();
+    try {
+      await Promise.all([refreshMe(), refreshJobs(), isAdmin() ? refreshAdmin() : null]);
+      await new Promise((r) => setTimeout(r, Math.max(0, 650 - (Date.now() - t0))));   // let the spinner be seen
+      animate($("tab-" + state.tab), "refreshed", 700);
+      haptic("ok"); toast("✨ Updated", "ok");
+    } catch (e) { toast(e.message || "Refresh failed", "err"); haptic("err"); }
+    finally {
+      btn.classList.remove("spin"); ptr.className = "ptr"; ptr.style.transform = "";
+      $("content").style.transform = ""; state.refreshing = false;
+    }
+  }
+  $("btn-refresh").onclick = () => refreshAll("button");
+
+  (function pullToRefresh() {
+    const THRESH = 40, MAX = 110;                            // px of (damped) travel to arm
+    let startY = 0, dy = 0, active = false, armed = false;
+    const content = $("content"), ptr = $("ptr");
+    const canPull = () => !$("view-main").classList.contains("hidden") && window.scrollY <= 0 && !state.refreshing
+      && $("sheet").classList.contains("hidden") && $("usheet").classList.contains("hidden");
+    document.addEventListener("touchstart", (e) => {
+      if (!canPull() || e.touches.length !== 1) return;
+      startY = e.touches[0].clientY; dy = 0; active = true; armed = false;
+    }, { passive: true });
+    document.addEventListener("touchmove", (e) => {
+      if (!active) return;
+      dy = e.touches[0].clientY - startY;
+      if (dy <= 0 || window.scrollY > 0) { if (dy < 0) active = false; content.style.transform = ""; ptr.className = "ptr"; return; }
+      const d = Math.min(MAX, dy * 0.55);                     // rubber-band damping
+      content.classList.add("pulling"); ptr.classList.add("pulling");
+      content.style.transform = `translateY(${d}px)`;
+      ptr.style.opacity = Math.min(1, d / 40);
+      ptr.style.transform = `translate(-50%, ${d - 46}px) rotate(${d * 3}deg)`;
+      const nowArmed = d >= THRESH;
+      if (nowArmed !== armed) { armed = nowArmed; ptr.classList.toggle("armed", armed); haptic(armed ? "medium" : "light"); }
+    }, { passive: true });
+    const end = () => {
+      if (!active) return; active = false;
+      content.classList.remove("pulling"); ptr.classList.remove("pulling");
+      ptr.style.opacity = "";
+      if (armed) { content.style.transform = "translateY(46px)"; refreshAll("pull"); }
+      else { content.style.transform = ""; ptr.style.transform = ""; ptr.className = "ptr"; }
+      armed = false;
+    };
+    document.addEventListener("touchend", end, { passive: true });
+    document.addEventListener("touchcancel", end, { passive: true });
+  })();
 
   // ── Locked view (approval flow) ───────────────────────────────────────
   function showLocked(data) {
@@ -483,19 +593,19 @@
     clearTimeout(state.lockedTimer);
     if (status === "pending" || (status === "rejected" && a.cooldown)) state.lockedTimer = setTimeout(recheckAccess, 15000);
   }
-  async function recheckAccess() {
+  async function recheckAccess(manual) {
     try {
       const r = await api("/api/me");            // succeeds only when approved
       haptic("ok"); toast("✅ Access granted", "ok"); boot(r);
     } catch (e) {
-      if (e.code === "locked") showLocked(e.data);
+      if (e.code === "locked") { showLocked(e.data); if (manual) { toast("Still waiting…"); haptic("warn"); } }
       else if (e.code === "auth" || e.status === 401) show("auth");
-      else { $("locked-error").textContent = e.message; $("locked-error").classList.remove("hidden"); }
+      else { $("locked-error").textContent = e.message; $("locked-error").classList.remove("hidden"); haptic("err"); }
     }
   }
   $("request-form").onsubmit = async (e) => {
     e.preventDefault(); $("locked-error").classList.add("hidden");
-    const btn = e.target.querySelector("button"); btn.disabled = true; haptic();
+    const btn = e.target.querySelector("button"); btn.disabled = true; haptic("medium");
     try {
       const r = await api("/api/access/request", { method: "POST", body: { note: $("request-note").value.trim() } });
       $("request-note").value = "";
@@ -507,11 +617,11 @@
       $("locked-error").textContent = er.message; $("locked-error").classList.remove("hidden"); haptic("err");
     } finally { btn.disabled = false; }
   };
-  $("btn-recheck").onclick = async () => { haptic(); $("btn-recheck").disabled = true; await recheckAccess(); $("btn-recheck").disabled = false; };
+  $("btn-recheck").onclick = async () => { $("btn-recheck").disabled = true; await recheckAccess(true); $("btn-recheck").disabled = false; };
   $("btn-withdraw").onclick = async () => {
     if (!(await ask("Withdraw your access request?"))) return;
-    try { const r = await api("/api/access/withdraw", { method: "POST", body: {} }); toast("Request withdrawn"); showLocked({ me: r.me, config: state.config }); }
-    catch (e) { toast(e.message, "err"); }
+    try { const r = await api("/api/access/withdraw", { method: "POST", body: {} }); toast("Request withdrawn"); haptic("ok"); showLocked({ me: r.me, config: state.config }); }
+    catch (e) { toast(e.message, "err"); haptic("err"); }
   };
 
   // ── Boot ──────────────────────────────────────────────────────────────
@@ -525,6 +635,7 @@
       if (/admin/.test(location.hash) && isAdmin()) setTab("admin");
     });
     if (isAdmin()) refreshAdmin();
+    haptic("soft");
   }
   async function start() {
     try { boot(await api("/api/me")); }
