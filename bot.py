@@ -48,8 +48,10 @@ from pyrogram import Client, enums, filters, idle  # noqa: E402
 from pyrogram.errors import (FloodWait, MessageIdInvalid, MessageNotModified,  # noqa: E402
                              RPCError)
 from pyrogram.raw import functions  # noqa: E402
-from pyrogram.types import (CallbackQuery, ChatMemberUpdated, InlineKeyboardButton,  # noqa: E402
-                            InlineKeyboardMarkup, Message)
+from pyrogram.types import (BotCommand, BotCommandScopeAllPrivateChats,  # noqa: E402
+                            BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
+                            ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
+                            KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 try:
     from pypdf import PdfReader
@@ -366,6 +368,104 @@ def home_keyboard(uid: int) -> InlineKeyboardMarkup:
 def back_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav:home")]])
 
+
+# ── Reply keyboard (persistent bottom menu) — role based ───────────────────
+# Every button label maps to the command it triggers. Users see only the
+# user buttons; the owner additionally gets the admin row(s).
+BTN_HOME      = "🏠 Home"
+BTN_SETTINGS  = "⚙️ Settings"
+BTN_QUEUE     = "📋 Queue"
+BTN_MYSTATS   = "📊 My Stats"
+BTN_CANCEL    = "🛑 Cancel Job"
+BTN_HELP      = "ℹ️ Help"
+BTN_MYID      = "🆔 My ID"
+BTN_OWNER     = "👑 Owner Panel"
+BTN_USERS     = "👥 Users"
+BTN_BROADCAST = "📣 Broadcast"
+BTN_LINKS     = "🔗 Links"
+
+USER_BUTTONS: Dict[str, str] = {
+    BTN_HOME: "start", BTN_SETTINGS: "settings", BTN_QUEUE: "queue",
+    BTN_MYSTATS: "mystats", BTN_CANCEL: "cancel", BTN_HELP: "help", BTN_MYID: "id",
+}
+OWNER_BUTTONS: Dict[str, str] = {
+    BTN_OWNER: "stats", BTN_USERS: "users", BTN_BROADCAST: "broadcast", BTN_LINKS: "links",
+}
+ALL_BUTTONS: Dict[str, str] = {**USER_BUTTONS, **OWNER_BUTTONS}
+
+def reply_keyboard(uid: int) -> ReplyKeyboardMarkup:
+    """Bottom keyboard. Owner gets extra admin rows; normal users only the basics."""
+    rows = [
+        [KeyboardButton(BTN_HOME), KeyboardButton(BTN_SETTINGS), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_QUEUE), KeyboardButton(BTN_MYSTATS), KeyboardButton(BTN_CANCEL)],
+    ]
+    if store.is_owner(uid):
+        rows.append([KeyboardButton(BTN_OWNER), KeyboardButton(BTN_USERS)])
+        rows.append([KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_LINKS)])
+    else:
+        rows.append([KeyboardButton(BTN_MYID)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
+                               placeholder="📎 Send a document or pick an option…")
+
+def locked_keyboard() -> ReplyKeyboardMarkup:
+    """Minimal keyboard for people who are not unlocked yet."""
+    return ReplyKeyboardMarkup([[KeyboardButton(BTN_MYID)]], resize_keyboard=True, is_persistent=True,
+                               placeholder="🔒 Send the security code…")
+
+
+# ── Bot command menu (the “/” list) — role based via BotCommandScope ───────
+USER_COMMANDS = [
+    BotCommand("start",    "🏠 Home screen"),
+    BotCommand("settings", "⚙️ Default language, format, split size"),
+    BotCommand("queue",    "📋 Current queue status"),
+    BotCommand("cancel",   "🛑 Cancel your active / queued jobs"),
+    BotCommand("mystats",  "📊 Your usage statistics"),
+    BotCommand("help",     "ℹ️ How to use the bot"),
+    BotCommand("id",       "🆔 Show your Telegram ID"),
+]
+OWNER_COMMANDS = USER_COMMANDS + [
+    BotCommand("stats",     "👑 Owner panel / global stats"),
+    BotCommand("users",     "👥 List authorized users"),
+    BotCommand("adduser",   "➕ Authorize a user: /adduser <id>"),
+    BotCommand("deluser",   "➖ Revoke a user: /deluser <id>"),
+    BotCommand("broadcast", "📣 Message all users (text or reply)"),
+    BotCommand("setcode",   "🔐 Change the security code"),
+    BotCommand("links",     "🔗 Invite links of admin chats"),
+]
+LOCKED_COMMANDS = [
+    BotCommand("start", "🔒 Unlock the bot with the security code"),
+    BotCommand("id",    "🆔 Show your Telegram ID"),
+]
+_COMMANDS_SET: set = set()   # chat ids that already have per-chat commands
+
+async def set_global_commands() -> None:
+    """Default scope: what a stranger / normal user sees in the “/” menu."""
+    base = USER_COMMANDS if PUBLIC_MODE else LOCKED_COMMANDS
+    for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):
+        try:
+            await app.set_bot_commands(base, scope=scope)
+        except Exception as e:
+            log.debug("set_bot_commands(%s): %s", scope, e)
+
+async def set_user_commands(uid: int, force: bool = False) -> None:
+    """Per-chat scope: authorized users get user commands, the owner gets everything."""
+    if not uid or (uid in _COMMANDS_SET and not force):
+        return
+    cmds = OWNER_COMMANDS if store.is_owner(uid) else USER_COMMANDS
+    try:
+        await app.set_bot_commands(cmds, scope=BotCommandScopeChat(uid))
+        _COMMANDS_SET.add(uid)
+    except Exception as e:
+        log.debug("set_bot_commands(chat %s): %s", uid, e)
+
+async def clear_user_commands(uid: int) -> None:
+    """Revoked user → falls back to the locked default menu."""
+    _COMMANDS_SET.discard(uid)
+    try:
+        await app.delete_bot_commands(scope=BotCommandScopeChat(uid))
+    except Exception as e:
+        log.debug("delete_bot_commands(chat %s): %s", uid, e)
+
 def user_prefs(uid: int) -> Tuple[str, str, int]:
     lang = store.pref(uid, "lang", DEFAULT_LANG)
     fmt = store.pref(uid, "fmt", DEFAULT_FORMAT)
@@ -406,7 +506,11 @@ def text_help() -> str:
         "/queue – Current queue status\n"
         "/cancel – Cancel your active job\n"
         "/mystats – Your usage statistics\n"
-        "/help – This message\n\n"
+        "/help – This message\n"
+        "/id – Your Telegram ID\n\n"
+        f"{b('Menu')}\n"
+        "<i>Use the ⌨️ buttons at the bottom of the chat —\n"
+        "they trigger the same commands with one tap.</i>\n\n"
         f"{b('Split size')}\n"
         "Large books are delivered in parts.\n"
         f"Custom size: {MIN_SPLIT_KB} KB – {MAX_SPLIT_KB // 1024} MB\n"
@@ -1236,12 +1340,18 @@ async def unauthorized_message(_, m: Message):
             await m.delete()               # don't leave the code in chat history
         except Exception:
             pass
+        await set_user_commands(m.from_user.id, force=True)
         await m.reply(header("Access Granted", "✅") +
-                      f"Welcome, {b(m.from_user.first_name)}!\nRole: {b(role)}\n\nSend /start to begin.")
+                      f"Welcome, {b(m.from_user.first_name)}!\nRole: {b(role)}\n\n"
+                      "Use the menu below or send /start to begin.",
+                      reply_markup=reply_keyboard(m.from_user.id))
         return
+    if m.text and m.text.strip() == BTN_MYID:
+        return await m.reply(f"🆔 Your Telegram ID: {code(m.from_user.id)}")
     await m.reply(header("Security Locked", "🔒") +
                   "This bot is private.\nSend the <b>security code</b> to unlock.\n\n"
-                  f"<i>Your ID: {code(m.from_user.id)}</i>")
+                  f"<i>Your ID: {code(m.from_user.id)}</i>",
+                  reply_markup=locked_keyboard())
 
 @app.on_callback_query(~authorized_cb)
 async def unauthorized_callback(_, q: CallbackQuery):
@@ -1255,8 +1365,15 @@ async def unauthorized_callback(_, q: CallbackQuery):
 async def cmd_start(_, m: Message):
     touch_user(m)
     USER_STATE.pop(m.chat.id, None)
-    await m.reply(text_home(m.from_user.id, m.from_user.first_name or "there"),
-                  reply_markup=home_keyboard(m.from_user.id))
+    uid = m.from_user.id
+    await set_user_commands(uid)
+    # 1) persistent bottom reply keyboard (role based)  2) inline home menu
+    await m.reply(header("Menu", "⌨️") +
+                  ("👑 Owner menu enabled — admin buttons added below."
+                   if store.is_owner(uid) else "Use the buttons below for quick access."),
+                  reply_markup=reply_keyboard(uid))
+    await m.reply(text_home(uid, m.from_user.first_name or "there"),
+                  reply_markup=home_keyboard(uid))
 
 @app.on_message(filters.command("help") & PRIVATE & authorized)
 async def cmd_help(_, m: Message):
@@ -1381,9 +1498,11 @@ async def cmd_adduser(_, m: Message):
         return await m.reply("Usage: <code>/adduser 123456789</code>")
     uid = int(m.command[1])
     store.authorize(uid, "Added by owner")
+    await set_user_commands(uid, force=True)
     await m.reply(f"✅ User {code(uid)} authorized.\n"
                   f"<i>Add to AUTHORIZED_USERS env to keep after restarts.</i>")
-    await safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.")
+    await safe_send(uid, header("Access Granted", "✅") + "You have been authorized.\nSend /start to begin.",
+                    reply_markup=reply_keyboard(uid))
 
 @app.on_message(filters.command("deluser") & PRIVATE & owner_only)
 async def cmd_deluser(_, m: Message):
@@ -1391,6 +1510,10 @@ async def cmd_deluser(_, m: Message):
         return await m.reply("Usage: <code>/deluser 123456789</code>")
     uid = int(m.command[1])
     ok = store.revoke(uid)
+    if ok:
+        await clear_user_commands(uid)
+        await safe_send(uid, header("Access Revoked", "🔒") + "Your access has been removed.",
+                        reply_markup=ReplyKeyboardRemove())
     await m.reply(f"🗑 User {code(uid)} removed." if ok else "⚠️ Not found (or is the owner).")
 
 @app.on_message(filters.command("setcode") & PRIVATE & owner_only)
@@ -1411,9 +1534,10 @@ async def cmd_setcode(_, m: Message):
 @app.on_message(filters.command("broadcast") & PRIVATE & owner_only)
 async def cmd_broadcast(_, m: Message):
     src = m.reply_to_message
-    text = m.text.split(None, 1)[1] if len(m.command) > 1 else None
+    text = m.text.split(None, 1)[1] if len(m.command) > 1 and m.command[0] == "broadcast" else None
     if not src and not text:
-        return await m.reply("Usage: <code>/broadcast Hello everyone</code>")
+        return await m.reply("Usage: <code>/broadcast Hello everyone</code>\n"
+                             "or reply to any message with <code>/broadcast</code>.")
     sent = failed = 0
     status = await m.reply("📣 Broadcasting…")
     for uid in list(store.users.keys()):
@@ -1741,6 +1865,20 @@ async def handle_text(client: Client, m: Message):
     chat_id = m.chat.id
     text_lower = m.text.strip().lower()
 
+    # ── Reply-keyboard buttons → dispatch to the matching command ──────────
+    btn_cmd = ALL_BUTTONS.get(m.text.strip())
+    if btn_cmd:
+        if btn_cmd in OWNER_BUTTONS.values() and not store.is_owner(m.from_user.id):
+            # user somehow pressed an owner button (stale keyboard) → refresh their keyboard
+            return await m.reply("🔒 Owner only.", reply_markup=reply_keyboard(m.from_user.id))
+        m.command = [btn_cmd]            # so handlers see it as a real command
+        handler = {
+            "start": cmd_start, "settings": cmd_settings, "queue": cmd_queue,
+            "mystats": cmd_mystats, "cancel": cmd_cancel, "help": cmd_help, "id": cmd_id,
+            "stats": cmd_stats, "users": cmd_users, "broadcast": cmd_broadcast, "links": cmd_links,
+        }[btn_cmd]
+        return await handler(client, m)
+
     if text_lower == "give me link":
         if store.is_owner(m.from_user.id):
             return await cmd_links(client, m)
@@ -1866,6 +2004,10 @@ async def main():
 
     me = await app.get_me()
     BOT_USERNAME = me.username or ""
+    # Command menu: default scope = locked/user list; owner + pre-authorised users get their own list
+    await set_global_commands()
+    for uid in list(store.users.keys()):
+        await set_user_commands(uid, force=True)
     tasks = [asyncio.create_task(queue_worker(), name="queue_worker"),
              asyncio.create_task(janitor(), name="janitor"),
              asyncio.create_task(keep_alive(), name="keep_alive")]
