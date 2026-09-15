@@ -1137,8 +1137,15 @@ MENU_BUTTONS = {BTN_TOOLS: "tools", BTN_ADMIN: "admin", BTN_BACK: "main"}
 KB_PAGE: Dict[int, str] = {}      # chat_id → current keyboard page (RAM only)
 
 def _app_button() -> KeyboardButton:
-    if MINI_APP_URL.startswith("https://"):
-        return KeyboardButton(BTN_APP, web_app=WebAppInfo(url=MINI_APP_URL))
+    """Bottom-keyboard *Mini App* button.
+
+    Deliberately a plain text button (no ``web_app=``): tapping it is handled
+    like the ``/app`` command and the bot replies with a message carrying an
+    inline **📱 Open Mini App** button. This keeps the flow identical to the
+    command, always shows a fresh link and avoids Telegram's confusing
+    behaviour where a web_app reply-button opens the app without any trace
+    in the chat.
+    """
     return KeyboardButton(BTN_APP)
 
 def reply_keyboard(uid: int, page: str = "main") -> ReplyKeyboardMarkup:
@@ -1182,7 +1189,7 @@ def locked_keyboard(status: str = ACCESS_NONE) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, placeholder=ph)
 
 PAGE_TITLES = {
-    "main": ("Main Menu", "🏠", "Choose a section below.\n📱 Mini App opens the full dashboard."),
+    "main": ("Main Menu", "🏠", "Choose a section below.\n📱 Mini App sends you a link to the full dashboard."),
     "tools": ("Tools", "🛠", "Queue · stats · cancel · access · your ID"),
     "settings": ("Settings", "⚙️", "Change your defaults for ⚡ Quick Start."),
     "admin": ("Admin", "👑", "Approve requests, manage users, broadcast."),

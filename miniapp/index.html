@@ -27,10 +27,30 @@
 <body>
   <div id="app" class="app">
 
-    <!-- ── Splash / loading ─────────────────────────────────────────── -->
-    <section id="view-loading" class="view center">
-      <div class="logo pulse">📚</div>
-      <p class="muted">Connecting…</p>
+    <!-- ── Skeleton shell (shown while the first /api/me request is in flight) ── -->
+    <section id="view-loading" class="view skeleton-view" aria-busy="true" aria-label="Loading">
+      <header class="topbar">
+        <div class="who">
+          <div class="skel circle"></div>
+          <div class="skel-col"><div class="skel line" style="width:130px"></div><div class="skel line sm" style="width:90px"></div></div>
+        </div>
+        <div class="skel pill-skel"></div>
+      </header>
+      <div class="card"><div class="skel line title" style="width:45%"></div>
+        <div class="skel-job"><div class="skel line" style="width:70%"></div><div class="skel line sm" style="width:50%"></div><div class="skel bar"></div></div></div>
+      <div class="card"><div class="skel line title" style="width:30%"></div>
+        <div class="skel line" style="width:85%"></div><div class="skel line sm" style="width:60%"></div></div>
+      <div class="grid3">
+        <div class="stat"><div class="skel line big"></div><div class="skel line sm" style="width:50%;margin:6px auto 0"></div></div>
+        <div class="stat"><div class="skel line big"></div><div class="skel line sm" style="width:50%;margin:6px auto 0"></div></div>
+        <div class="stat"><div class="skel line big"></div><div class="skel line sm" style="width:50%;margin:6px auto 0"></div></div>
+      </div>
+      <div class="card"><div class="skel line title" style="width:38%"></div>
+        <div class="skel line" style="width:92%"></div><div class="skel line" style="width:76%"></div><div class="skel line sm" style="width:55%"></div></div>
+      <nav class="bottomnav skeleton-nav">
+        <div class="skel nav-skel"></div><div class="skel nav-skel"></div><div class="skel nav-skel"></div>
+      </nav>
+      <p class="tiny muted center connecting">Connecting…</p>
     </section>
 
     <!-- ── Locked (approval based) ──────────────────────────────────── -->
@@ -67,6 +87,14 @@
 
     <!-- ── Main shell ───────────────────────────────────────────────── -->
     <section id="view-main" class="view hidden">
+      <!-- pull-to-refresh indicator -->
+      <div id="ptr" class="ptr" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M21 3v6h-6"/>
+        </svg>
+      </div>
+
+      <div id="content">
       <header class="topbar">
         <div class="who">
           <img id="avatar" class="avatar hidden" alt="">
@@ -76,7 +104,14 @@
             <div class="tiny muted" id="me-sub">—</div>
           </div>
         </div>
-        <div id="db-pill" class="pill" title="Storage">🗄</div>
+        <div class="top-actions">
+          <div id="db-pill" class="pill" title="Storage">🗄</div>
+          <button id="btn-refresh" class="iconbtn" title="Refresh" aria-label="Refresh">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M21 3v6h-6"/>
+            </svg>
+          </button>
+        </div>
       </header>
 
       <!-- Tabs -->
@@ -95,12 +130,12 @@
 
           <div class="card">
             <div class="card-title">▶️ Live progress</div>
-            <div id="active-box"><p class="muted small">Nothing is running right now.</p></div>
+            <div id="active-box" class="skel-host"><div class="skel-job"><div class="skel line" style="width:65%"></div><div class="skel line sm" style="width:45%"></div><div class="skel bar"></div></div></div>
           </div>
 
           <div class="card">
-            <div class="card-title">📋 Queue <span id="queue-count" class="chip">0</span></div>
-            <div id="queue-list"><p class="muted small">Queue is empty.</p></div>
+            <div class="card-title">📋 Queue <span id="queue-count" class="chip">–</span></div>
+            <div id="queue-list" class="skel-host"><div class="skel line" style="width:80%"></div><div class="skel line sm" style="width:55%"></div></div>
           </div>
 
           <div class="grid3">
@@ -111,7 +146,7 @@
 
           <div class="card" id="access-card">
             <div class="card-title">🎫 My access <span id="access-chip" class="chip"></span></div>
-            <div id="access-body" class="small"></div>
+            <div id="access-body" class="small skel-host"><div class="skel line" style="width:90%"></div><div class="skel line" style="width:70%"></div></div>
           </div>
 
           <div class="card howto">
@@ -128,15 +163,15 @@
         <div id="tab-settings" class="tab hidden">
           <div class="card">
             <div class="card-title">🌐 Target language</div>
-            <div id="lang-grid" class="choices"></div>
+            <div id="lang-grid" class="choices skel-host"><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div></div>
           </div>
           <div class="card">
             <div class="card-title">📄 Output format</div>
-            <div id="fmt-grid" class="choices row"></div>
+            <div id="fmt-grid" class="choices row skel-host"><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div></div>
           </div>
           <div class="card">
             <div class="card-title">✂️ Split size</div>
-            <div id="split-grid" class="choices row"></div>
+            <div id="split-grid" class="choices row skel-host"><div class="skel choice-skel"></div><div class="skel choice-skel"></div><div class="skel choice-skel"></div></div>
             <div class="inline-input">
               <input id="split-custom" type="number" min="0" placeholder="Custom KB">
               <button id="split-apply" class="btn small">Apply</button>
@@ -150,7 +185,7 @@
         <div id="tab-history" class="tab hidden">
           <div class="card">
             <div class="card-title">🕘 Recent jobs</div>
-            <div id="history-list"><p class="muted small">No history yet.</p></div>
+            <div id="history-list" class="skel-host"><div class="skel-job"><div class="skel line" style="width:60%"></div><div class="skel line sm" style="width:85%"></div></div><div class="skel-job"><div class="skel line" style="width:50%"></div><div class="skel line sm" style="width:75%"></div></div></div>
           </div>
         </div>
 
@@ -175,8 +210,8 @@
           </div>
 
           <div class="card accent" id="pending-req-card">
-            <div class="card-title">⏳ Access requests <span id="a-pending" class="chip">0</span></div>
-            <div id="admin-pending"><p class="muted small">No pending requests. 🎉</p></div>
+            <div class="card-title">⏳ Access requests <span id="a-pending" class="chip">–</span></div>
+            <div id="admin-pending" class="skel-host"><div class="skel-job"><div class="skel line" style="width:55%"></div><div class="skel line sm" style="width:80%"></div></div></div>
           </div>
 
           <div class="card">
@@ -195,7 +230,7 @@
               <select id="adduser-plan"></select>
               <button type="submit" class="btn small primary">Approve</button>
             </form>
-            <div id="admin-users"></div>
+            <div id="admin-users" class="skel-host"><div class="skel-user"><div class="skel-col"><div class="skel line" style="width:120px"></div><div class="skel line sm" style="width:170px"></div></div><div class="skel chip-skel"></div></div><div class="skel-user"><div class="skel-col"><div class="skel line" style="width:90px"></div><div class="skel line sm" style="width:150px"></div></div><div class="skel chip-skel"></div></div><div class="skel-user"><div class="skel-col"><div class="skel line" style="width:110px"></div><div class="skel line sm" style="width:160px"></div></div><div class="skel chip-skel"></div></div></div>
           </div>
 
           <div class="card owner-only">
@@ -206,15 +241,16 @@
 
           <div class="card owner-only">
             <div class="card-title">📜 Audit log</div>
-            <div id="admin-audit"><p class="muted small">Nothing yet.</p></div>
+            <div id="admin-audit" class="skel-host"><div class="skel line" style="width:88%"></div><div class="skel line" style="width:72%"></div><div class="skel line sm" style="width:60%"></div></div>
           </div>
 
           <div class="card owner-only">
             <div class="card-title">🕘 Recent (all users)</div>
-            <div id="admin-recent"></div>
+            <div id="admin-recent" class="skel-host"><div class="skel-job"><div class="skel line" style="width:60%"></div><div class="skel line sm" style="width:85%"></div></div></div>
           </div>
         </div>
       </main>
+      </div><!-- /content -->
 
       <!-- Bottom nav -->
       <nav class="bottomnav">
@@ -228,6 +264,7 @@
     <!-- User management sheet (admin) -->
     <div id="usheet" class="sheet hidden">
       <div class="sheet-body">
+        <div class="grabber"></div>
         <div class="sheet-head">
           <b id="usheet-title">👤 User</b>
           <button id="usheet-close" class="x">✕</button>
@@ -246,6 +283,7 @@
     <!-- Job configuration sheet (from "Configure in Mini App") -->
     <div id="sheet" class="sheet hidden">
       <div class="sheet-body">
+        <div class="grabber"></div>
         <div class="sheet-head">
           <b>⚙️ Configure job</b>
           <button id="sheet-close" class="x">✕</button>
