@@ -1,4 +1,4 @@
-"""Shared configuration for the NovelTranslator PRO master and workers."""
+"""Shared configuration for NovelTranslator PRO master and workers (v6.0 Master-Worker)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:  # pragma: no cover - dotenv is optional in tiny test harnesses
+except ImportError:
     pass
 
 
@@ -37,23 +37,40 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def env_int_list(name: str) -> List[int]:
-    return [int(value) for value in re.split(r"[,\s;]+", env(name)) if value.lstrip("-").isdigit()]
+    out: List[int] = []
+    for tok in re.split(r"[,\s;]+", env(name)):
+        tok = tok.strip()
+        if tok.lstrip("-").isdigit():
+            out.append(int(tok))
+    return out
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔑 TELEGRAM & IDENTITY
+# ═══════════════════════════════════════════════════════════════════════════
 API_ID = env_int("API_ID", 0)
 API_HASH = env("API_HASH")
 BOT_TOKEN = env("BOT_TOKEN")
 OWNER_ID = env_int("OWNER_ID", 0)
 AUTHORIZED_USERS = env_int_list("AUTHORIZED_USERS")
 ADMIN_USERS = env_int_list("ADMIN_USERS")
-PUBLIC_MODE = env_bool("PUBLIC_MODE")
+PUBLIC_MODE = env_bool("PUBLIC_MODE", False)
 DEFAULT_APPROVAL = env("DEFAULT_APPROVAL", "1m")
 EXPIRY_REMINDER_DAYS = max(0, min(env_int("EXPIRY_REMINDER_DAYS", 3), 30))
 REJECT_COOLDOWN_H = max(0, env_int("REJECT_COOLDOWN_H", 24))
 LEGACY_USERS = env("LEGACY_USERS", "keep").lower()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 📋 BOT IDENTITY & VERSIONING
+# ═══════════════════════════════════════════════════════════════════════════
 BOT_NAME = env("BOT_NAME", "NovelTranslator PRO")
 VERSION = "6.0-master-worker"
+SERVICE_ROLE = env("SERVICE_ROLE", "master").lower()  # "master" or "worker"
+WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ⚙️ TRANSLATION SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
 CONCURRENCY_LIMIT = max(1, min(env_int("CONCURRENCY", 8), 20))
 CHUNK_SIZE = max(500, min(env_int("CHUNK_SIZE", 3500), 4800))
 MAX_RETRIES = 5
@@ -67,61 +84,131 @@ DEFAULT_FORMAT = env("DEFAULT_FORMAT", "txt")
 DEFAULT_SPLIT_KB = env_int("DEFAULT_SPLIT_KB", 500)
 MIN_SPLIT_KB, MAX_SPLIT_KB = 50, 15 * 1024
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🌐 WEB SERVER & NETWORKING
+# ═══════════════════════════════════════════════════════════════════════════
 PORT = env_int("PORT", 10000)
 PUBLIC_URL = (env("PUBLIC_URL") or env("RENDER_EXTERNAL_URL")).rstrip("/")
 RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL").rstrip("/")
 KEEP_ALIVE = env_bool("KEEP_ALIVE", True)
 KEEP_ALIVE_INTERVAL = max(60, env_int("KEEP_ALIVE_INTERVAL", 600))
-ROLE = env("SERVICE_ROLE", "master").lower()
-WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
-WORKER_HEARTBEAT_INTERVAL = max(10, env_int("WORKER_HEARTBEAT_INTERVAL", 30))
-WORKER_POLL_INTERVAL = max(1, env_int("WORKER_POLL_INTERVAL", 3))
 
-MONGO_URI = env("MONGO_URI") or env("MONGODB_URI") or env("DATABASE_URL")
-MONGO_DB = env("MONGO_DB", "noveltranslator")
+# ═══════════════════════════════════════════════════════════════════════════
+# 🗄 MONGODB & JOB QUEUE
+# ═══════════════════════════════════════════════════════════════════════════
+MONGO_URI = env("MONGO_URI") or env("MONGODB_URI") or env("DATABASE_URL") or (
+    "mongodb+srv://bhuimharniteshbhuimhar_db_user:nitesh9939"
+    "@nitesh99390.qbwrf1c.mongodb.net/?appName=Nitesh99390&retryWrites=true&w=majority"
+)
 if MONGO_URI.lower() in {"0", "off", "none", "memory", "disabled"}:
     MONGO_URI = ""
-
+MONGO_DB = env("MONGO_DB", "noveltranslator")
 HISTORY_LIMIT = max(5, min(env_int("HISTORY_LIMIT", 30), 100))
 DB_BUDGET_MB = max(50, min(env_int("DB_BUDGET_MB", 400), 512))
 DB_MAX_JOB_DOCS = max(200, env_int("DB_MAX_JOB_DOCS", 3000))
 DB_JOB_TTL_DAYS = max(7, min(env_int("DB_JOB_TTL_DAYS", 60), 365))
+
+# Worker polling & heartbeat
+WORKER_HEARTBEAT_INTERVAL = max(10, env_int("WORKER_HEARTBEAT_INTERVAL", 30))
+WORKER_POLL_INTERVAL = max(1, env_int("WORKER_POLL_INTERVAL", 3))
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📱 MINI APP & WEB INTERFACE
+# ═══════════════════════════════════════════════════════════════════════════
+MINI_APP_URL = env("MINI_APP_URL") or (f"{PUBLIC_URL}/app" if PUBLIC_URL else "")
+MINI_APP_DIR = env("MINI_APP_DIR") or str(Path(__file__).with_name("miniapp"))
 MINIAPP_DEV_USER = env_int("MINIAPP_DEV_USER", 0)
 INIT_DATA_MAX_AGE = 24 * 3600
-MINI_APP_DIR = env("MINI_APP_DIR") or str(Path(__file__).with_name("miniapp"))
-MINI_APP_URL = env("MINI_APP_URL") or (f"{PUBLIC_URL}/app" if PUBLIC_URL else "")
 BACKUP_GROUP_ID = env_int("BACKUP_GROUP_ID", 0)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 📂 STORAGE & TEMPORARY FILES
+# ═══════════════════════════════════════════════════════════════════════════
 BASE_DIR = env("WORK_DIR") or str(Path(tempfile.gettempdir()) / "noveltranslator")
 STORAGE_DIR = str(Path(BASE_DIR) / "out")
 INBOX_DIR = str(Path(BASE_DIR) / "inbox")
 Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
 Path(INBOX_DIR).mkdir(parents=True, exist_ok=True)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🌍 LANGUAGE & FORMAT SUPPORT
+# ═══════════════════════════════════════════════════════════════════════════
+INPUT_EXTS = {".epub", ".txt", ".docx", ".pdf"}
+OUTPUT_FORMATS = {"txt": "📄 TXT", "docx": "📝 DOCX", "epub": "📚 EPUB"}
+SPLIT_PRESETS = [
+    (0, "🚫 No split"),
+    (100, "100 KB"),
+    (300, "300 KB"),
+    (500, "500 KB"),
+    (1024, "1 MB"),
+    (2048, "2 MB"),
+    (5120, "5 MB"),
+]
+
 LANGUAGES: Dict[str, Tuple[str, str]] = {
-    "hi": ("Hindi", "🇮🇳"), "en": ("English", "🇬🇧"), "bn": ("Bengali", "🇧🇩"),
-    "ta": ("Tamil", "🇮🇳"), "te": ("Telugu", "🇮🇳"), "mr": ("Marathi", "🇮🇳"),
-    "gu": ("Gujarati", "🇮🇳"), "kn": ("Kannada", "🇮🇳"), "ml": ("Malayalam", "🇮🇳"),
-    "pa": ("Punjabi", "🇮🇳"), "ur": ("Urdu", "🇵🇰"), "ne": ("Nepali", "🇳🇵"),
-    "es": ("Spanish", "🇪🇸"), "fr": ("French", "🇫🇷"), "de": ("German", "🇩🇪"),
-    "pt": ("Portuguese", "🇧🇷"), "ru": ("Russian", "🇷🇺"), "ar": ("Arabic", "🇸🇦"),
-    "id": ("Indonesian", "🇮🇩"), "tr": ("Turkish", "🇹🇷"), "vi": ("Vietnamese", "🇻🇳"),
-    "th": ("Thai", "🇹🇭"), "zh-CN": ("Chinese", "🇨🇳"), "ja": ("Japanese", "🇯🇵"),
+    "hi": ("Hindi", "🇮🇳"),
+    "en": ("English", "🇬🇧"),
+    "bn": ("Bengali", "🇧🇩"),
+    "ta": ("Tamil", "🇮🇳"),
+    "te": ("Telugu", "🇮🇳"),
+    "mr": ("Marathi", "🇮🇳"),
+    "gu": ("Gujarati", "🇮🇳"),
+    "kn": ("Kannada", "🇮🇳"),
+    "ml": ("Malayalam", "🇮🇳"),
+    "pa": ("Punjabi", "🇮🇳"),
+    "ur": ("Urdu", "🇵🇰"),
+    "ne": ("Nepali", "🇳🇵"),
+    "es": ("Spanish", "🇪🇸"),
+    "fr": ("French", "🇫🇷"),
+    "de": ("German", "🇩🇪"),
+    "pt": ("Portuguese", "🇧🇷"),
+    "ru": ("Russian", "🇷🇺"),
+    "ar": ("Arabic", "🇸🇦"),
+    "id": ("Indonesian", "🇮🇩"),
+    "tr": ("Turkish", "🇹🇷"),
+    "vi": ("Vietnamese", "🇻🇳"),
+    "th": ("Thai", "🇹🇭"),
+    "zh-CN": ("Chinese", "🇨🇳"),
+    "ja": ("Japanese", "🇯🇵"),
     "ko": ("Korean", "🇰🇷"),
 }
-OUTPUT_FORMATS = {"txt": "📄 TXT", "docx": "📝 DOCX", "epub": "📚 EPUB"}
-INPUT_EXTS = {".epub", ".txt", ".docx", ".pdf"}
-EXPANSION = {**{key: 2.6 for key in ("hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa", "ne")},
-             "ur": 1.9, "ar": 1.8, "ru": 1.8, "th": 2.6, "zh-CN": 0.9, "ja": 1.2, "ko": 1.2}
-SPLIT_PRESETS = [(0, "🚫 No split"), (100, "100 KB"), (300, "300 KB"), (500, "500 KB"),
-                 (1024, "1 MB"), (2048, "2 MB"), (5120, "5 MB")]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-                    stream=sys.stdout, force=True)
+EXPANSION = {
+    **{k: 2.6 for k in ("hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa", "ne")},
+    "ur": 1.9,
+    "ar": 1.8,
+    "ru": 1.8,
+    "th": 2.6,
+    "zh-CN": 0.9,
+    "ja": 1.2,
+    "ko": 1.2,
+}
+
+if DEFAULT_LANG not in LANGUAGES:
+    DEFAULT_LANG = "hi"
+if DEFAULT_FORMAT not in OUTPUT_FORMATS:
+    DEFAULT_FORMAT = "txt"
+if DEFAULT_SPLIT_KB and not (MIN_SPLIT_KB <= DEFAULT_SPLIT_KB <= MAX_SPLIT_KB):
+    DEFAULT_SPLIT_KB = 500
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📊 LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 log = logging.getLogger("noveltranslator")
+
+BOOT_TS = time.time()
 
 
 def validate_config(require_telegram: bool = True) -> None:
+    """Validate required environment variables."""
     problems = []
     if require_telegram and not API_ID:
         problems.append("API_ID")
@@ -129,10 +216,7 @@ def validate_config(require_telegram: bool = True) -> None:
         problems.append("API_HASH")
     if require_telegram and (not BOT_TOKEN or ":" not in BOT_TOKEN):
         problems.append("BOT_TOKEN")
-    if ROLE == "master" and not OWNER_ID and not PUBLIC_MODE:
+    if require_telegram and SERVICE_ROLE == "master" and not OWNER_ID and not PUBLIC_MODE:
         problems.append("OWNER_ID")
     if problems:
         raise RuntimeError("Missing or invalid environment variables: " + ", ".join(problems))
-
-
-BOOT_TS = time.time()
