@@ -19,6 +19,10 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 - **Fast async translation engine** – direct HTTP to Google's web endpoint via aiohttp, per-line segments so paragraph structure survives 1:1, exponential-backoff retries + thread fallback
 - **Live dashboard** – progress bar, speed, ETA, flood-safe message edits
 - **Job queue** with position updates, per-user job limit, cancel button, 4-step wizard + ⚡ Quick Start
+- **Role-based menus** – persistent bottom reply keyboard + Telegram “/” command list.
+  Locked visitors see only `/start` `/id` + a 🆔 My ID button; authorized users get the
+  user buttons/commands; the owner additionally gets 👑 Owner Panel · 👥 Users · 📣 Broadcast · 🔗 Links
+  (per-chat `BotCommandScope`, so each person sees exactly the commands they can use)
 - **Security-code gate**, owner panel, `/adduser`, `/deluser`, `/broadcast`, `/setcode`, `/id`
 - **Optional backup group** – each job gets its own forum topic with all delivered parts (set `BACKUP_GROUP_ID=0` to disable)
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
