@@ -3955,7 +3955,10 @@ async def health(_request: web.Request) -> web.Response:
 async def index(_request: web.Request) -> web.Response:
     body = (f"<!doctype html><meta charset='utf-8'><title>{html.escape(BOT_NAME)}</title>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<body style='font-family:system-ui;padding:2rem;background:#0f172a;color:#e2e8f0'>"
+            f"<link rel='preconnect' href='https://fonts.googleapis.com'>"
+            f"<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap'>"
+            f"<body style=\"font-family:'Plus Jakarta Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased;"
+            f"padding:2rem;background:#0f172a;color:#e2e8f0;line-height:1.5\">"
             f"<h1>📚 {html.escape(BOT_NAME)}</h1>"
             f"<p>Telegram bot is <b style='color:#4ade80'>online</b>"
             + (f" as <a style='color:#93c5fd' href='https://t.me/{html.escape(BOT_USERNAME)}'>@{html.escape(BOT_USERNAME)}</a>" if BOT_USERNAME else "")
