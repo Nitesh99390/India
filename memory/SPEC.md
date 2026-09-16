@@ -8,25 +8,21 @@ DOCX or EPUB parts back to the user.
 ## Runtime architecture
 - `master.py` is the only Telegram polling process and serves the Mini App/API and health endpoint.
 - `worker.py` runs without Telegram polling, claims `jobs_queue` documents atomically, processes files from GridFS, reports progress, delivers output, and sends heartbeats to `workers_status`.
-- v6.1: the master embeds a `TranslationWorker` (same Pyrogram client, `EMBEDDED_WORKER=1` default) so a single free service is a complete deployment; standalone workers add capacity. `EMBEDDED_WORKER=0` gives a polling-only master.
-- `config.py` is the single source of truth for credentials (built-in defaults, env overrides); `bot.py` no longer parses env vars itself.
 - Multiple workers share MongoDB and one bot token; only one master may be deployed for a bot token.
 
 ## Data model
 - `users`, `stats`, `jobs`, `chats`, `meta`, and `audit` preserve the existing approval/access system.
 - `documents.files` / `documents.chunks` are GridFS storage for transient source uploads.
-- `jobs_queue` stores `job_id` (also `_id`), `file_id`, `chat_id`, `user_id`, preferences, status (`queued` → `running` → `done`/`failed`/`cancelled`), worker id, `heartbeat`, `requeues`, progress (phase, part/parts, chunks, ratio, speed, eta, elapsed) and timestamps. Finished docs are pruned after `QUEUE_DONE_KEEP_H`.
-- `workers_status` stores node id, idle/running state, current job, `embedded` flag, `jobs_done`/`jobs_failed`, version and `last_seen` heartbeat.
+- `jobs_queue` stores `job_id`, `file_id`, `chat_id`, `user_id`, preferences, status, worker id, progress and timestamps.
+- `workers_status` stores node id, idle/running state, current job and `last_seen` heartbeat.
 
 ## Key flows
 1. Approved user sends a supported document to the master.
 2. Master downloads into memory, uploads the bytes to GridFS, and presents the existing options wizard.
 3. Confirming options writes a queued job to MongoDB; no Telegram polling or heavy translation runs on the master.
 4. A worker atomically claims the oldest queued job, downloads to a temporary directory, translates and sends progress edits/output documents.
-5. Worker marks the job complete/failed/cancelled, writes history, removes the GridFS source, and cleans temporary files. On shutdown a running job is re-queued (source kept).
-6. Every worker's `recover_loop` (or the master janitor when no worker is embedded) re-queues `running` jobs whose heartbeat is older than `WORKER_STALE_AFTER`, failing them after `JOB_MAX_REQUEUES`.
-7. Cancel (`/cancel`, inline button, Mini App) updates the persisted queue document; the worker observes it via `touch_job` on the next progress tick and stops.
-8. Admin Mini App reads `/api/admin/overview` and displays active worker heartbeats, embedded badge and per-node counters; `/health` reports `master+worker`.
+5. Worker marks the job complete/failed, writes history, removes the GridFS source, and cleans temporary files.
+6. Admin Mini App reads `/api/admin/overview` and displays active worker heartbeats.
 
 ## Access and authentication
 The existing approval-based access model remains in place. Telegram Mini App requests
