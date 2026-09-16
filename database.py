@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,6 +21,7 @@ from config import (DB_JOB_TTL_DAYS, JOB_MAX_REQUEUES, MONGO_DB, MONGO_URI, QUEU
                     WORKER_HEARTBEAT_INTERVAL, WORKER_STALE_AFTER)
 
 FINISHED = ("done", "failed", "cancelled")
+log = logging.getLogger("database")
 
 
 class MongoDatabase:
@@ -44,21 +46,46 @@ class MongoDatabase:
             await self.client.admin.command("ping")
             self.db = self.client[self.db_name]
             self.files = AsyncIOMotorGridFSBucket(self.db, bucket_name="documents")
-            await self.ensure_indexes()
-            return True
-        except Exception:
+        except Exception as e:
+            log.error("MongoDB connection failed: %s: %s", type(e).__name__, e)
             self.client = self.db = self.files = None
             return False
+        # Index maintenance is best-effort: a name/option conflict with an index the
+        # master created earlier must never take the worker down.
+        await self.ensure_indexes()
+        return True
+
+    async def _index(self, coll, keys, **opts) -> None:
+        try:
+            await coll.create_index(keys, **opts)
+        except Exception as e:  # IndexOptionsConflict / IndexKeySpecsConflict etc.
+            log.warning("index %s.%s: %s", coll.name, opts.get("name") or keys, e)
 
     async def ensure_indexes(self) -> None:
         if self.db is None:
             return
-        await self.db.jobs_queue.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
-        await self.db.jobs_queue.create_index("user_id")
-        await self.db.jobs_queue.create_index("updated_at")
-        await self.db.workers_status.create_index("last_seen")
-        await self.db.jobs.create_index([("uid", ASCENDING), ("ts", DESCENDING)])
-        await self.db.jobs.create_index("ts", expireAfterSeconds=DB_JOB_TTL_DAYS * 86400)
+        # Default (auto-generated) names — identical to what earlier versions created.
+        await self._index(self.db.jobs_queue, [("status", ASCENDING), ("created_at", ASCENDING)])
+        await self._index(self.db.jobs_queue, "user_id")
+        await self._index(self.db.jobs_queue, "updated_at")
+        await self._index(self.db.workers_status, "last_seen")
+        # Same names the master (bot.py) uses, so both processes agree on the `jobs` indexes.
+        await self._index(self.db.jobs, [("uid", ASCENDING), ("ts", DESCENDING)], name="uid_ts")
+        want = DB_JOB_TTL_DAYS * 86400
+        try:
+            existing = await self.db.jobs.index_information()
+        except Exception:
+            existing = {}
+        for name, info in existing.items():
+            keys = info.get("key") or []
+            if keys and len(keys) == 1 and keys[0][0] == "ts" and "expireAfterSeconds" in info:
+                if int(info["expireAfterSeconds"]) == want:
+                    return  # TTL index already correct — leave it alone
+                try:  # MongoDB cannot change expireAfterSeconds in place
+                    await self.db.jobs.drop_index(name)
+                except Exception as e:
+                    log.debug("drop_index %s: %s", name, e)
+        await self._index(self.db.jobs, "ts", name="ts_ttl", expireAfterSeconds=want)
 
     async def upload_bytes(self, filename: str, content: bytes, metadata: Dict[str, Any]) -> Optional[str]:
         if self.files is None:

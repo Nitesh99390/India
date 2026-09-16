@@ -8,10 +8,10 @@ deployment**. Extra stateless `worker.py` services simply add parallel capacity.
 Workers translate whole documents (EPUB / TXT / DOCX / PDF) into 25 languages and
 deliver the result as TXT, DOCX or EPUB — split into parts of any size you like.
 
-> 🔐 **Secrets stay out of the repo.** `config.py` is the single source of truth for
-> configuration, but Telegram `API_ID` / `API_HASH` / `BOT_TOKEN` and `OWNER_ID` are read
-> **only** from environment variables (Render dashboard, Docker `-e`, or a local `.env`).
-> The bot refuses to start and tells you exactly which variable is missing.
+> 🚀 **Zero-config deploy.** `config.py` is the single source of truth and ships working
+> built-in defaults for Telegram `API_ID` / `API_HASH` / `BOT_TOKEN`, `OWNER_ID` and
+> `MONGO_URI`. Both `master.py` and `worker.py` start with an **empty environment** —
+> just deploy. Set an env var (Render dashboard, Docker `-e`, or `.env`) only to override.
 
 > 🗄 **MongoDB persistence out of the box.** The bot ships with the project's own
 > MongoDB Atlas free-tier (M0, 512 MB) connection string baked in, so users, settings,
@@ -90,18 +90,15 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 
 1. **Fork / push** this repo to GitHub.
 2. Render Dashboard → **New → Blueprint** → select the repo. `render.yaml` creates the master service (which already includes an embedded worker) and one optional extra worker service. Delete the extra worker to stay within a single free instance, or add more for parallel capacity.
-3. Fill the secret environment variables:
+3. Nothing to fill in — the credentials below are built into `config.py`. Override only if you want to:
 
-   | Variable        | Where to get it                                             |
-   |-----------------|-------------------------------------------------------------|
-   | `API_ID`        | https://my.telegram.org → API development tools             |
-   | `API_HASH`      | same page                                                   |
-   | `BOT_TOKEN`     | @BotFather → `/newbot`                                      |
-   | `OWNER_ID`      | your numeric Telegram ID (send `/id` to the bot, or @userinfobot) — **required**, the owner approves everyone else |
-
-   Optional: `MONGO_URI` → your own free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster
-   connection string (`mongodb+srv://…`). Allow access from `0.0.0.0/0` in Atlas Network Access.
-   Leave it empty to use the built-in project cluster, or set `MONGO_URI=off` for RAM-only.
+   | Variable        | Built-in default | Where to get your own                              |
+   |-----------------|------------------|----------------------------------------------------|
+   | `API_ID`        | ✅ included      | https://my.telegram.org → API development tools    |
+   | `API_HASH`      | ✅ included      | same page                                          |
+   | `BOT_TOKEN`     | ✅ included      | @BotFather → `/newbot`                             |
+   | `OWNER_ID`      | ✅ `6069200310`  | your numeric Telegram ID (send `/id` to the bot)   |
+   | `MONGO_URI`     | ✅ project Atlas cluster | your own free [MongoDB Atlas](https://www.mongodb.com/atlas) `mongodb+srv://…` (allow `0.0.0.0/0`); `off` = RAM-only |
 
 4. Deploy. Open the service URL → you should see “Telegram bot is online”.
 5. Send `/start` to your bot. The **📱 App** menu button opens the dashboard directly and the
@@ -114,14 +111,14 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 >   (`KEEP_ALIVE=0` to disable). Free tier also has a monthly hour budget.
 > - With `MONGO_URI=off` every deploy/restart wipes memory: approvals, pending requests and the
 >   audit log are lost. Put permanent IDs in `AUTHORIZED_USERS` / `ADMIN_USERS` — or keep MongoDB on.
-> - Set `OWNER_ID` explicitly — without an owner nobody can approve requests.
+> - `OWNER_ID` defaults to the built-in owner; set it explicitly to make someone else the owner.
 
 ## ⚙️ Configuration
 
 | Variable             | Default | Description                                                   |
 |----------------------|---------|---------------------------------------------------------------|
-| `API_ID` / `API_HASH` / `BOT_TOKEN` | **required** | Telegram credentials (my.telegram.org · @BotFather)   |
-| `OWNER_ID`           | **required** | Permanent owner (approves requests, manages admins). Send `/id` to the bot |
+| `API_ID` / `API_HASH` / `BOT_TOKEN` | built-in | Telegram credentials (my.telegram.org · @BotFather) — override to use another bot |
+| `OWNER_ID`           | `6069200310` | Permanent owner (approves requests, manages admins). Send `/id` to the bot |
 | `ADMIN_USERS`        | —       | Comma-separated IDs that are admins on every start (can approve users) |
 | `AUTHORIZED_USERS`   | —       | Comma-separated IDs with lifetime access on every start        |
 | `PUBLIC_MODE`        | `0`     | `1` → everyone is approved automatically                       |
@@ -162,7 +159,7 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 git clone https://github.com/Nitesh99390/India.git && cd India
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+cp .env.example .env      # optional — everything already has a built-in default
 python master.py          # Telegram polling + embedded worker + Mini App at http://localhost:10000/health
 # Optional — extra capacity, with the same MongoDB and Telegram credentials:
 SERVICE_ROLE=worker WORKER_NODE_ID=worker-1 PORT=10001 python worker.py

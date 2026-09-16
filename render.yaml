@@ -1,7 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  Render Blueprint — NovelTranslator PRO v6.2 (master + embedded worker · MongoDB GridFS)
-#  Dashboard → New → Blueprint → pick this repo → fill the secret env vars
-#  (API_ID · API_HASH · BOT_TOKEN · OWNER_ID — they are NOT stored in the repo).
+#  Dashboard → New → Blueprint → pick this repo → Apply. NOTHING to fill in:
+#  API_ID · API_HASH · BOT_TOKEN · OWNER_ID · MONGO_URI all have working
+#  built-in defaults in config.py (set an env var only to override).
 #  The master service alone is a complete deployment (EMBEDDED_WORKER=1).
 #  The second service is an OPTIONAL extra worker for parallel capacity —
 #  delete it to stay within a single free instance.
@@ -21,16 +22,15 @@ services:
         value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
-      # ── Telegram credentials (https://my.telegram.org & @BotFather) ──
-      - key: API_ID
-        sync: false
-      - key: API_HASH
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      # ── Access control (approval based — the owner / admins approve users) ──
-      - key: OWNER_ID              # your numeric Telegram ID (send /id to the bot)
-        sync: false
+      # ── Telegram credentials & owner: built into config.py. Uncomment to override. ──
+      # - key: API_ID
+      #   value: "36681596"
+      # - key: API_HASH
+      #   value: your_api_hash
+      # - key: BOT_TOKEN
+      #   value: 123456:your_bot_token
+      # - key: OWNER_ID              # your numeric Telegram ID (send /id to the bot)
+      #   value: "6069200310"
       - key: ADMIN_USERS           # optional: comma-separated IDs that may approve users
         value: ""
       - key: AUTHORIZED_USERS      # optional: comma-separated IDs with lifetime access
@@ -43,9 +43,9 @@ services:
         value: "3"
       - key: REJECT_COOLDOWN_H     # hours before a rejected user may request again
         value: "24"
-      # ── MongoDB. Empty → built-in Atlas free-tier cluster · your own mongodb+srv://… · "off" = RAM-only ──
-      - key: MONGO_URI
-        sync: false
+      # ── MongoDB: built-in Atlas free-tier cluster. Uncomment to use your own · "off" = RAM-only ──
+      # - key: MONGO_URI
+      #   value: mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
       - key: MONGO_DB
         value: noveltranslator
       - key: SERVICE_ROLE
@@ -98,14 +98,16 @@ services:
         value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: API_ID
-        sync: false
-      - key: API_HASH
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: MONGO_URI
-        sync: false
+      # Telegram credentials + MongoDB are built into config.py — nothing to fill in.
+      # Uncomment to override:
+      # - key: API_ID
+      #   value: "36681596"
+      # - key: API_HASH
+      #   value: your_api_hash
+      # - key: BOT_TOKEN
+      #   value: 123456:your_bot_token
+      # - key: MONGO_URI
+      #   value: mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
       - key: MONGO_DB
         value: noveltranslator
       - key: SERVICE_ROLE
