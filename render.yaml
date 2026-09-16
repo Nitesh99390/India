@@ -1,8 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render Blueprint — NovelTranslator PRO v6.4 (master + embedded worker · MongoDB GridFS)
-#  Dashboard → New → Blueprint → pick this repo → Apply. NOTHING to fill in:
-#  API_ID · API_HASH · BOT_TOKEN · OWNER_ID · MONGO_URI all have working
-#  built-in defaults in config.py (set an env var only to override).
+#  Render Blueprint — NovelTranslator PRO v6.5 (master + embedded worker · MongoDB GridFS)
+#  Dashboard → New → Blueprint → pick this repo → Apply. ONE thing to fill in:
+#  BOT_TOKEN (from @BotFather) — Render prompts for it because `sync: false`.
+#  API_ID · API_HASH · OWNER_ID · MONGO_URI have working built-in defaults in
+#  config.py (set an env var only to override). The bot token is never committed.
 #  The master service alone is a complete deployment (EMBEDDED_WORKER=1).
 #  The second service is an OPTIONAL extra worker for parallel capacity —
 #  delete it to stay within a single free instance.
@@ -22,13 +23,15 @@ services:
         value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
-      # ── Telegram credentials & owner: built into config.py. Uncomment to override. ──
+      # ── REQUIRED: the bot token from @BotFather (/newbot). Entered once in the
+      #    Render dashboard (Blueprint prompt or Environment tab); never stored in git. ──
+      - key: BOT_TOKEN
+        sync: false
+      # ── API_ID / API_HASH / OWNER_ID: built into config.py. Uncomment to override. ──
       # - key: API_ID
       #   value: "36681596"
       # - key: API_HASH
       #   value: your_api_hash
-      # - key: BOT_TOKEN
-      #   value: 123456:your_bot_token
       # - key: OWNER_ID              # your numeric Telegram ID (send /id to the bot)
       #   value: "6069200310"
       - key: ADMIN_USERS           # optional: comma-separated IDs that may approve users
@@ -100,14 +103,15 @@ services:
         value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
-      # Telegram credentials + MongoDB are built into config.py — nothing to fill in.
-      # Uncomment to override:
+      # REQUIRED: the SAME bot token as the master service (workers send the output
+      # through the same bot). Entered in the Render dashboard, never in git.
+      - key: BOT_TOKEN
+        sync: false
+      # API_ID / API_HASH + MongoDB are built into config.py. Uncomment to override:
       # - key: API_ID
       #   value: "36681596"
       # - key: API_HASH
       #   value: your_api_hash
-      # - key: BOT_TOKEN
-      #   value: 123456:your_bot_token
       # - key: MONGO_URI
       #   value: mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
       - key: MONGO_DB

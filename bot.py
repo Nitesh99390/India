@@ -119,7 +119,8 @@ def validate_config() -> None:
         _validate_config(require_telegram=True, role="master")
     except RuntimeError as e:
         log.critical("%s", e)
-        log.critical("Set the missing values in the Render dashboard → Environment (or .env), then redeploy.")
+        log.critical("BOT_TOKEN is the only value without a built-in default — set it in the Render dashboard → "
+                     "Environment (or .env), then redeploy.")
         sys.exit(1)
     if _env("SECURITY_CODE"):
         log.warning("SECURITY_CODE is no longer used — access is approval based now (v5). You can remove the variable.")

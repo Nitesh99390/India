@@ -3,7 +3,7 @@
     python tests/test_worker_offline.py
 """
 import asyncio, os, sys, time
-os.environ.update(API_ID="1", API_HASH="x", BOT_TOKEN="1:x", MONGO_URI="off", OWNER_ID="1")
+os.environ.update(API_ID="1", API_HASH="x", BOT_TOKEN="1234567890:TESTtesttesttesttesttesttesttestte", MONGO_URI="off", OWNER_ID="1")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import translator, worker
 
