@@ -3924,6 +3924,41 @@ _STATIC_TYPES = {".html": "text/html", ".css": "text/css", ".js": "application/j
                  ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
                  ".json": "application/json", ".webmanifest": "application/manifest+json"}
 
+_ASSET_V_CACHE: Dict[str, str] = {}
+
+
+def _asset_version() -> str:
+    """Short fingerprint of the Mini App bundle (app.js + style.css).
+
+    ``index.html`` references its assets as ``/app/app.js?v=__ASSET_V__``; the
+    placeholder is replaced with this value when the page is served. Because
+    the version changes whenever the files change, Telegram's aggressive
+    WebView cache can never pair a new ``index.html`` with a stale ``app.js``
+    (the classic "stuck on the skeleton after a deploy" bug), while unchanged
+    assets stay cacheable for a long time.
+    """
+    sig = []
+    for name in ("app.js", "style.css"):
+        try:
+            st = os.stat(os.path.join(MINI_APP_DIR, name))
+            sig.append(f"{name}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            sig.append(f"{name}:missing")
+    key = "|".join(sig)
+    if key not in _ASSET_V_CACHE:
+        _ASSET_V_CACHE.clear()          # only ever one live entry
+        h = hashlib.sha1()
+        for name in ("app.js", "style.css"):
+            try:
+                with open(os.path.join(MINI_APP_DIR, name), "rb") as fh:
+                    h.update(fh.read())
+            except OSError:
+                h.update(b"missing")
+        h.update(VERSION.encode())
+        _ASSET_V_CACHE[key] = h.hexdigest()[:10]
+    return _ASSET_V_CACHE[key]
+
+
 async def miniapp_file(request: web.Request) -> web.Response:
     rel = request.match_info.get("path", "") or "index.html"
     rel = os.path.normpath(rel).lstrip(os.sep).replace("\\", "/")
@@ -3937,9 +3972,20 @@ async def miniapp_file(request: web.Request) -> web.Response:
             raise web.HTTPNotFound()
     ext = os.path.splitext(path)[1].lower()
     ctype = _STATIC_TYPES.get(ext, "application/octet-stream")
-    headers = {"Cache-Control": "no-cache"} if ext == ".html" else {"Cache-Control": "public, max-age=300"}
-    return web.FileResponse(path, headers={**headers, "Content-Type": f"{ctype}; charset=utf-8"
-                                           if ctype.startswith("text/") or "javascript" in ctype or "json" in ctype else ctype})
+    if ext == ".html":
+        # The shell is tiny and must always be fresh so it points at the current asset version.
+        with open(path, "r", encoding="utf-8") as fh:
+            body = fh.read().replace("__ASSET_V__", _asset_version())
+        return web.Response(text=body, content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-store, max-age=0", "X-Asset-Version": _asset_version()})
+    # Versioned assets (…?v=<hash>) are immutable; bare requests get a short TTL + revalidation.
+    if request.query.get("v"):
+        cache = "public, max-age=31536000, immutable"
+    else:
+        cache = "public, max-age=300, must-revalidate"
+    text_like = ctype.startswith("text/") or "javascript" in ctype or "json" in ctype
+    return web.FileResponse(path, headers={"Cache-Control": cache,
+                                           "Content-Type": f"{ctype}; charset=utf-8" if text_like else ctype})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

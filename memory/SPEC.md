@@ -33,3 +33,15 @@ The existing approval-based access model remains in place. Telegram Mini App req
 use signed `initData`; `MINIAPP_DEV_USER` is available only for local harnesses when
 no Render URL is configured. Owner and admin roles are controlled by the existing
 `OWNER_ID`, `ADMIN_USERS` and approval actions.
+## Mini App front-end (v6.3)
+- Static shell in `miniapp/` (no build step). `bot.py` serves `index.html` with `Cache-Control: no-store` and
+  substitutes `__ASSET_V__` with a hash of `app.js` + `style.css` + `VERSION`; `?v=<hash>` assets are `immutable`.
+- Boot: `start()` loops `/api/me` with backoff (`BOOT_DELAYS`) while the server is cold/5xx/unreachable, keeping the
+  skeleton visible with a status line; hard 4xx failures show a Retry button. `locked` → locked view, `auth`/401 →
+  auth view (or "Session expired" after boot).
+- Polling: single scheduler, one in-flight request per endpoint, `POLL_LIVE` 2.5 s while a job is active/queued,
+  `POLL_IDLE` 8 s otherwise, exponential backoff up to 30 s on failures, paused while `document.hidden` or the
+  Telegram Mini App is `deactivated`; resumed on `visibilitychange`/`activated`/`online`.
+- Rendering: `setHTML()` morphs the DOM (rows keyed by `data-id` / `data-user` / `data-key`) instead of replacing
+  `innerHTML`; inputs are never overwritten while focused; entrance animations run only when nodes are added.
+- Tests: `tests/test_api_flow.py` (API) and `tests/test_miniapp_ui.py` (headless Chromium) against `tests/devctl.sh`.

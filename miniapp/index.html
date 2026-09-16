@@ -6,12 +6,22 @@
   <meta name="color-scheme" content="light dark">
   <title>NovelTranslator PRO</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E">
-  <!-- Modern typography: Plus Jakarta Sans (UI) · Noto Sans Devanagari (Hindi) · JetBrains Mono (code) -->
+  <!-- Modern typography: Plus Jakarta Sans (UI) · Noto Sans Devanagari (Hindi) · JetBrains Mono (code)
+       Loaded *non-blocking*: the skeleton paints with the system font immediately and the
+       web font swaps in when (if) it arrives — a slow fonts CDN must never delay first paint. -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="/app/style.css">
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" media="print" onload="this.media='all'"
+        href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/app/style.css?v=__ASSET_V__">
+  <!-- Critical inline styles so the skeleton is visible even before style.css arrives -->
+  <style>
+    html,body{margin:0;background:var(--tg-theme-bg-color,#0f172a);color:var(--tg-theme-text-color,#e2e8f0);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif}
+    .hidden{display:none!important}
+  </style>
+  <!-- `defer` keeps both scripts off the critical path: the document paints first, scripts run in order afterwards -->
+  <script defer src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="/app/app.js?v=__ASSET_V__"></script>
   <script>
     // Debug hook: after load, log which view is visible (helps headless checks)
     window.addEventListener("load", () => setTimeout(() => {
@@ -50,7 +60,10 @@
       <nav class="bottomnav skeleton-nav">
         <div class="skel nav-skel"></div><div class="skel nav-skel"></div><div class="skel nav-skel"></div>
       </nav>
-      <p class="tiny muted center connecting">Connecting…</p>
+      <div class="connecting">
+        <p class="tiny muted center" id="loading-status">Connecting…</p>
+        <button id="btn-retry" class="btn primary small hidden" type="button">↻ Retry</button>
+      </div>
     </section>
 
     <!-- ── Locked (approval based) ──────────────────────────────────── -->
@@ -79,9 +92,9 @@
     <!-- ── Auth error (opened outside Telegram) ─────────────────────── -->
     <section id="view-auth" class="view center hidden">
       <div class="logo">📱</div>
-      <h1>Open from Telegram</h1>
-      <p class="muted">This dashboard only works inside the Telegram app.<br>
-        Send <code>/app</code> to the bot and tap the button.</p>
+      <h1 id="auth-title">Open from Telegram</h1>
+      <p class="muted" id="auth-text">This dashboard only works inside the Telegram app.
+        Send /app to the bot and tap the button.</p>
       <a id="auth-link" class="btn primary hidden" href="#">Open the bot</a>
     </section>
 
@@ -310,7 +323,5 @@
 
     <div id="toast" class="toast hidden"></div>
   </div>
-
-  <script src="/app/app.js"></script>
 </body>
 </html>

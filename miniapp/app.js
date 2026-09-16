@@ -10,8 +10,11 @@
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   const state = { me: null, config: null, jobs: null, admin: null, tab: "home", timer: null, sheetJob: null,
-                  filter: "all", sheetUser: null, lockedTimer: null, refreshing: false };
+                  filter: "all", sheetUser: null, lockedTimer: null, refreshing: false,
+                  pollFails: 0, lastPoll: 0, lastMe: 0, booted: false };
   const TAB_ORDER = ["home", "settings", "history", "admin"];
+  const POLL_LIVE = 2500, POLL_IDLE = 8000, POLL_MAX_BACKOFF = 30000;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ── Telegram bootstrap ────────────────────────────────────────────────
   if (tg) {
@@ -49,18 +52,85 @@
   const ask = (msg) => { haptic("warn"); return tg && tg.showConfirm ? new Promise((r) => tg.showConfirm(msg, r)) : Promise.resolve(confirm(msg)); };
 
   // ── API helper ────────────────────────────────────────────────────────
+  // Every request has a hard timeout (a hung request must never leave the UI
+  // stuck on the skeleton). Network failures / timeouts are flagged with
+  // `err.network = true` so callers can retry quietly instead of showing a
+  // misleading error screen.
   async function api(path, opts = {}) {
+    const { timeout = 20000, body, ...rest } = opts;
     const headers = { "Content-Type": "application/json" };
     if (initData) headers["Authorization"] = "tma " + initData;
-    const res = await fetch(path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const tid = ctl ? setTimeout(() => ctl.abort(), timeout) : 0;
+    let res;
+    try {
+      res = await fetch(path, { ...rest, headers, cache: "no-store", signal: ctl ? ctl.signal : undefined,
+                                body: body ? JSON.stringify(body) : undefined });
+    } catch (e) {
+      const err = new Error(e && e.name === "AbortError" ? "Request timed out" : "Network error");
+      err.network = true; err.status = 0; err.data = {};
+      throw err;
+    } finally { clearTimeout(tid); }
     let data = {};
     try { data = await res.json(); } catch (_) {}
     if (!res.ok || data.ok === false) {
       const err = new Error(data.error || ("HTTP " + res.status));
       err.code = data.code; err.status = res.status; err.data = data;
+      // Reverse-proxy answers while the backend is (re)starting → treat like a network hiccup
+      err.network = !data.error && [502, 503, 504].includes(res.status);
       throw err;
     }
     return data;
+  }
+
+  // ── DOM morphing ─────────────────────────────────────────────────────
+  // Background polls must never *look* like a page reload. Instead of
+  // `el.innerHTML = html` (which throws away every node → entrance animations
+  // replay, progress bars jump, taps get lost) we diff the new markup against
+  // the live DOM and patch only what changed. Rows are matched by key
+  // (data-id / data-user) so reordering keeps the same nodes.
+  const keyOf = (n) => n.nodeType === 1 ? (n.getAttribute("data-id") || n.getAttribute("data-user") || n.getAttribute("data-key") || "") : "";
+  function morphAttrs(from, to) {
+    for (const a of Array.from(from.attributes)) if (!to.hasAttribute(a.name)) from.removeAttribute(a.name);
+    for (const a of Array.from(to.attributes)) if (from.getAttribute(a.name) !== a.value) from.setAttribute(a.name, a.value);
+  }
+  function morphChildren(from, to) {
+    const tc = Array.from(to.childNodes);
+    for (let i = 0; i < tc.length; i++) {
+      const t = tc[i], cur = from.childNodes[i] || null, k = keyOf(t);
+      let match = null;
+      if (cur && cur.nodeType === t.nodeType && (t.nodeType !== 1 || (cur.tagName === t.tagName && keyOf(cur) === k))) match = cur;
+      else if (k) for (let j = i + 1; j < from.childNodes.length; j++) {
+        const c = from.childNodes[j];
+        if (c.nodeType === 1 && c.tagName === t.tagName && keyOf(c) === k) { match = c; break; }
+      }
+      if (!match) { from.insertBefore(t.cloneNode(true), cur); continue; }
+      if (match !== cur) from.insertBefore(match, cur);
+      if (t.nodeType === 3 || t.nodeType === 8) { if (match.nodeValue !== t.nodeValue) match.nodeValue = t.nodeValue; }
+      else morph(match, t);
+    }
+    while (from.childNodes.length > tc.length) from.removeChild(from.lastChild);
+  }
+  function morph(from, to) {
+    morphAttrs(from, to);
+    // never rewrite what the user may be typing in / has selected
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(from.tagName)) return;
+    morphChildren(from, to);
+  }
+  // Set a container's markup: first paint replaces the skeleton outright,
+  // later paints are diffed. No-op when the markup did not change at all.
+  function setHTML(el, html) {
+    if (typeof el === "string") el = $(el);
+    if (!el || el._html === html) return;
+    const first = el._html === undefined;
+    el._html = html;
+    if (first || !el.firstChild) { el.innerHTML = html; el.classList.remove("skel-host"); return; }
+    const tmp = document.createElement(el.tagName); tmp.innerHTML = html;
+    morphChildren(el, tmp);
+  }
+  function setText(el, s) {
+    if (typeof el === "string") el = $(el);
+    if (el && el.textContent !== String(s)) el.textContent = s;
   }
 
   // ── UI utils ──────────────────────────────────────────────────────────
@@ -111,27 +181,31 @@
   // ── Render: header + stats ────────────────────────────────────────────
   function renderMe() {
     const me = state.me, cfg = state.config;
-    $("me-name").textContent = me.name;
-    const role = $("me-role"); role.textContent = me.owner ? "owner" : me.admin ? "admin" : me.role;
-    role.className = "badge " + (me.owner ? "owner" : me.admin ? "admin" : "");
-    $("me-sub").textContent = (me.username ? "@" + me.username + " · " : "") + "ID " + me.id;
-    if (me.photo) { $("avatar").src = me.photo; $("avatar").classList.remove("hidden"); $("avatar-fallback").classList.add("hidden"); }
-    const pill = $("db-pill"); pill.textContent = cfg.db ? "🗄 MongoDB" : "🧠 RAM"; pill.classList.toggle("on", !!cfg.db);
+    setText("me-name", me.name);
+    const role = $("me-role"); setText(role, me.owner ? "owner" : me.admin ? "admin" : me.role);
+    const roleCls = "badge " + (me.owner ? "owner" : me.admin ? "admin" : "");
+    if (role.className !== roleCls) role.className = roleCls;
+    setText("me-sub", (me.username ? "@" + me.username + " · " : "") + "ID " + me.id);
+    if (me.photo) {
+      const av = $("avatar");
+      if (av.getAttribute("src") !== me.photo) av.src = me.photo;          // don't re-download on every poll
+      av.classList.remove("hidden"); $("avatar-fallback").classList.add("hidden");
+    }
+    const pill = $("db-pill"); setText(pill, cfg.db ? "🗄 MongoDB" : "🧠 RAM"); pill.classList.toggle("on", !!cfg.db);
     pill.title = cfg.db ? "Persistent storage: " + cfg.db_name : "In-memory — settings reset on restart";
     setNum("s-jobs", fmtInt(me.stats.jobs)); setNum("s-parts", fmtInt(me.stats.parts)); setNum("s-chars", fmtInt(me.stats.chars));
     $("nav-admin").classList.toggle("hidden", !isAdmin());
     document.querySelectorAll(".owner-only").forEach((el) => el.classList.toggle("hidden", !me.owner));
-    $("pdf-ext").textContent = (cfg.input_exts || []).includes(".pdf") ? " / .pdf" : "";
-    $("settings-note").textContent = cfg.db ? "Saved to your profile — used by ⚡ Quick Start." : "⚠️ No database — settings reset when the server restarts.";
-    $("split-hint").textContent = `0 = no split · ${cfg.split_range[0]} KB – ${Math.round(cfg.split_range[1] / 1024)} MB`;
+    setText("pdf-ext", (cfg.input_exts || []).includes(".pdf") ? " / .pdf" : "");
+    setText("settings-note", cfg.db ? "Saved to your profile — used by ⚡ Quick Start." : "⚠️ No database — settings reset when the server restarts.");
+    setText("split-hint", `0 = no split · ${cfg.split_range[0]} KB – ${Math.round(cfg.split_range[1] / 1024)} MB`);
     renderAccess();
   }
 
   // ── Render: my access card (home tab) ─────────────────────────────────
   function renderAccess() {
     const me = state.me, a = me.access || {}, cfg = state.config || {};
-    const chip = $("access-chip");
-    chip.innerHTML = me.owner ? "👑 Owner" : `${a.icon || ""} ${esc(a.label || "")}`;
+    setHTML("access-chip", me.owner ? "👑 Owner" : `${a.icon || ""} ${esc(a.label || "")}`);
     const rows = [];
     if (me.owner) {
       rows.push(["Role", "👑 Owner · full access"]);
@@ -143,35 +217,41 @@
       if (a.approved_at) rows.push(["Approved", fmtDate(a.approved_at)]);
     }
     if (cfg.public_mode) rows.push(["Mode", "🌐 Public bot"]);
-    $("access-body").innerHTML = rows.map(([k, v]) =>
-      `<div class="access-row"><span class="muted">${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
+    setHTML("access-body", rows.map(([k, v]) =>
+      `<div class="access-row"><span class="muted">${esc(k)}</span><b>${esc(v)}</b></div>`).join(""));
     // Banner: expiring soon
     const banner = $("access-banner");
     if (!me.owner && a.expires && a.days_left != null && a.days_left <= (cfg.reminder_days || 3)) {
-      banner.className = "banner warn";
-      banner.textContent = a.days_left <= 0 ? "⌛ Your access expires today. Ask the owner to extend it."
-        : `⏳ Your access expires in ${a.days_left} day${a.days_left === 1 ? "" : "s"} (${fmtDate(a.expires)}).`;
-    } else { banner.className = "banner warn hidden"; }
+      banner.classList.remove("hidden");
+      setText(banner, a.days_left <= 0 ? "⌛ Your access expires today. Ask the owner to extend it."
+        : `⏳ Your access expires in ${a.days_left} day${a.days_left === 1 ? "" : "s"} (${fmtDate(a.expires)}).`);
+    } else { banner.classList.add("hidden"); }
   }
 
   // ── Render: settings ──────────────────────────────────────────────────
   function renderSettings() {
     const cfg = state.config, p = state.me.prefs;
-    $("lang-grid").innerHTML = cfg.languages.map((l) =>
-      `<button class="choice ${l.code === p.lang ? "on" : ""}" data-k="lang" data-v="${esc(l.code)}">${l.flag} ${esc(l.name)}</button>`).join("");
-    $("fmt-grid").innerHTML = cfg.formats.map((f) =>
-      `<button class="choice ${f.code === p.fmt ? "on" : ""}" data-k="fmt" data-v="${esc(f.code)}">${esc(f.label)}</button>`).join("");
-    $("split-grid").innerHTML = cfg.split_presets.map((s) =>
-      `<button class="choice ${s.kb === p.split ? "on" : ""}" data-k="split" data-v="${s.kb}">${esc(s.label)}</button>`).join("");
-    $("split-custom").value = cfg.split_presets.some((s) => s.kb === p.split) ? "" : p.split;
+    setHTML("lang-grid", cfg.languages.map((l) =>
+      `<button class="choice ${l.code === p.lang ? "on" : ""}" data-k="lang" data-key="${esc(l.code)}" data-v="${esc(l.code)}">${l.flag} ${esc(l.name)}</button>`).join(""));
+    setHTML("fmt-grid", cfg.formats.map((f) =>
+      `<button class="choice ${f.code === p.fmt ? "on" : ""}" data-k="fmt" data-key="${esc(f.code)}" data-v="${esc(f.code)}">${esc(f.label)}</button>`).join(""));
+    setHTML("split-grid", cfg.split_presets.map((s) =>
+      `<button class="choice ${s.kb === p.split ? "on" : ""}" data-k="split" data-key="${s.kb}" data-v="${s.kb}">${esc(s.label)}</button>`).join(""));
+    const custom = $("split-custom"), want = cfg.split_presets.some((s) => s.kb === p.split) ? "" : String(p.split);
+    if (document.activeElement !== custom && custom.value !== want) custom.value = want;   // don't clobber typing
   }
+  let savingPref = false;
   async function savePref(k, v) {
+    if (savingPref) return; savingPref = true;
+    // optimistic highlight — the UI answers the tap instantly, the server confirms
+    document.querySelectorAll(`.choice[data-k="${k}"]`).forEach((b) => b.classList.toggle("on", b.dataset.v === String(v)));
     try {
       const body = {}; body[k] = k === "split" ? Number(v) : v;
       const r = await api("/api/settings", { method: "POST", body });
       state.me = r.me; renderSettings(); toast("✅ Saved", "ok"); haptic("ok");
       const on = document.querySelector(`.choice.on[data-k="${k}"]`); if (on) animate(on, "just-on", 400);
-    } catch (e) { toast(e.message, "err"); haptic("err"); }
+    } catch (e) { renderSettings(); toast(e.message, "err"); haptic("err"); }
+    finally { savingPref = false; }
   }
   document.addEventListener("click", (ev) => {
     const b = ev.target.closest(".choice"); if (b && b.dataset.k) savePref(b.dataset.k, b.dataset.v);
@@ -198,29 +278,30 @@
   function renderJobs() {
     const d = state.jobs; if (!d) return;
     $("alert-shutdown").classList.toggle("hidden", !d.shutting_down);
-    $("active-box").innerHTML = d.active ? jobRow(d.active) : `<p class="muted small">Nothing is running right now.</p>`;
+    setHTML("active-box", d.active ? jobRow(d.active) : `<p class="muted small">Nothing is running right now.</p>`);
     setNum("queue-count", d.queue_len);
-    $("queue-list").innerHTML = d.queue.length ? d.queue.map((j) => jobRow(j)).join("") : `<p class="muted small">Queue is empty.</p>`;
+    setHTML("queue-list", d.queue.length ? d.queue.map((j) => jobRow(j)).join("") : `<p class="muted small">Queue is empty.</p>`);
     const pend = d.pending || [];
     $("pending-card").classList.toggle("hidden", !pend.length);
-    $("pending-list").innerHTML = pend.map((j) => `<div class="job">
+    setHTML("pending-list", pend.map((j) => `<div class="job" data-id="${esc(j.job_id)}">
         <div class="job-head"><div class="job-name">${esc(j.name)}</div><span class="status">waiting for options</span></div>
         <div class="job-meta">${fmtSize(j.size)} · ${esc(j.ext)}</div>
         <div class="job-actions"><button class="btn small primary" data-config="${esc(j.job_id)}">⚙️ Configure &amp; start</button>
-        <button class="btn small danger" data-cancel="${esc(j.job_id)}">Discard</button></div></div>`).join("");
+        <button class="btn small danger" data-cancel="${esc(j.job_id)}">Discard</button></div></div>`).join(""));
     const hist = d.history || [];
-    $("history-list").innerHTML = hist.length ? hist.map(histRow).join("") : `<p class="muted small">No history yet.</p>`;
+    setHTML("history-list", hist.length ? hist.map(histRow).join("") : `<p class="muted small">No history yet.</p>`);
   }
   function histRow(h) {
-    return `<div class="job"><div class="job-head"><div class="job-name">${esc(h.name)}</div><span class="status ${esc(h.status)}">${esc(h.status)}</span></div>
+    return `<div class="job" data-id="${esc(h.job_id || (h.name + "|" + h.ts))}"><div class="job-head"><div class="job-name">${esc(h.name)}</div><span class="status ${esc(h.status)}">${esc(h.status)}</span></div>
       <div class="job-meta">${langLabel(h.lang)} · ${fmtLabel(h.fmt)} · ${fmtSize(h.size)}${h.parts ? " · " + h.parts + " parts" : ""}${h.chars ? " · " + fmtInt(h.chars) + " chars" : ""}${h.secs ? " · " + fmtTime(h.secs) : ""}${h.error ? " · " + esc(h.error) : ""}${h.user && isOwner() ? " · 👤 " + esc(h.user) : ""} · ${fmtAgo(h.ts)}</div></div>`;
   }
   document.addEventListener("click", async (ev) => {
     const c = ev.target.closest("[data-cancel]");
     if (c) {
       if (!(await ask("Cancel this job?"))) return;
-      try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: c.dataset.cancel } }); toast("🛑 Cancelled"); haptic("ok"); refreshJobs(); }
-      catch (e) { toast(e.message, "err"); haptic("err"); }
+      c.disabled = true;
+      try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: c.dataset.cancel } }); toast("🛑 Cancelled"); haptic("ok"); refreshJobs(true); }
+      catch (e) { c.disabled = false; toast(e.message, "err"); haptic("err"); }
     }
     const cfgBtn = ev.target.closest("[data-config]");
     if (cfgBtn) openSheet(cfgBtn.dataset.config);
@@ -262,14 +343,16 @@
     try {
       await api("/api/jobs/start", { method: "POST", body: { job_id: state.sheetJob.job_id,
         lang: $("sheet-lang").value, fmt: $("sheet-fmt").value, split: Number($("sheet-split").value) } });
-      toast("🚀 Job queued", "ok"); haptic("ok"); closeSheet(); refreshJobs();
+      toast("🚀 Job queued", "ok"); haptic("ok"); closeSheet(); refreshJobs(true);
     } catch (e) { toast(e.message, "err"); haptic("err"); }
     finally { $("sheet-start").disabled = false; }
   };
   $("sheet-cancel").onclick = async () => {
     if (!state.sheetJob) return;
-    try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: state.sheetJob.job_id } }); toast("Upload discarded"); haptic("ok"); closeSheet(); refreshJobs(); }
+    $("sheet-cancel").disabled = true;
+    try { await api("/api/jobs/cancel", { method: "POST", body: { job_id: state.sheetJob.job_id } }); toast("Upload discarded"); haptic("ok"); closeSheet(); refreshJobs(true); }
     catch (e) { toast(e.message, "err"); haptic("err"); }
+    finally { $("sheet-cancel").disabled = false; }
   };
 
   // ── Admin: overview ───────────────────────────────────────────────────
@@ -308,7 +391,7 @@
     const tgt = e.target ? esc(e.target_name || e.target) : "";
     const extra = [e.plan ? esc(e.plan) : "", e.expires === 0 && /approve|extend/.test(e.action) ? "♾" : e.expires ? "→ " + fmtDate(e.expires) : "",
       e.reason ? "“" + esc(e.reason) + "”" : ""].filter(Boolean).join(" · ");
-    return `<div class="audit"><b>${who}</b> ${esc(e.action)}${tgt ? " → <b>" + tgt + "</b>" : ""}${extra ? " · " + extra : ""} <span class="tiny">· ${fmtAgo(e.ts)}</span></div>`;
+    return `<div class="audit" data-key="${esc((e.ts || "") + "|" + (e.action || "") + "|" + (e.target || ""))}"><b>${who}</b> ${esc(e.action)}${tgt ? " → <b>" + tgt + "</b>" : ""}${extra ? " · " + extra : ""} <span class="tiny">· ${fmtAgo(e.ts)}</span></div>`;
   }
   function renderAdmin() {
     const a = state.admin; if (!a) return;
@@ -319,39 +402,45 @@
     if (bud) {
       const pct = Math.min(100, bud.percent || 0);
       $("db-bar").style.width = pct + "%"; $("db-bar").style.background = pct > 85 ? "var(--danger, #ef4444)" : "";
-      $("db-size").textContent = `${(bud.size_mb || 0).toFixed(1)} / ${bud.budget_mb} MB (${pct}%)`;
-      $("db-docs").textContent = `${fmtInt(bud.job_docs)} / ${fmtInt(bud.max_job_docs)} job docs · TTL ${bud.ttl_days} d${bud.pruned ? " · pruned " + fmtInt(bud.pruned) : ""}`;
+      setText("db-size", `${(bud.size_mb || 0).toFixed(1)} / ${bud.budget_mb} MB (${pct}%)`);
+      setText("db-docs", `${fmtInt(bud.job_docs)} / ${fmtInt(bud.max_job_docs)} job docs · TTL ${bud.ttl_days} d${bud.pruned ? " · pruned " + fmtInt(bud.pruned) : ""}`);
     }
     const workers = a.workers || [];
     const busy = workers.filter((w) => w.status === "running").length;
-    $("worker-count").textContent = `${a.workers_online || 0} online${busy ? ` · ${busy} busy` : ""}`;
-    $("worker-nodes").innerHTML = workers.length ? workers.map((worker) => {
+    setText("worker-count", `${a.workers_online || 0} online${busy ? ` · ${busy} busy` : ""}`);
+    setHTML("worker-nodes", workers.length ? workers.map((worker) => {
       const lastSeen = worker.last_seen ? fmtAgo(worker.last_seen) : "never";
       const current = worker.current_job ? `Translating ${esc(worker.current_job)}` : "Waiting for a job";
       const kind = worker.embedded ? " <span class=\"chip tiny\">embedded</span>" : "";
       const done = (worker.jobs_done || worker.jobs_failed)
         ? ` · ✅ ${fmtInt(worker.jobs_done || 0)}${worker.jobs_failed ? ` · ⚠️ ${fmtInt(worker.jobs_failed)}` : ""}` : "";
-      return `<div class="worker-node"><span class="worker-dot ${worker.status === "idle" ? "idle" : "on"}"></span><div><b>${esc(worker.node_id || "Worker")}</b>${kind}<div class="tiny muted">${esc(current)} · heartbeat ${esc(lastSeen)}${done}</div></div><span class="st ${worker.status === "idle" ? "approved" : "pending"}">${esc(worker.status || "unknown")}</span></div>`;
-    }).join("") : `<p class="muted small">No active worker nodes. The master runs an embedded worker when MongoDB is connected (EMBEDDED_WORKER=1); start extra Render worker services for more capacity.</p>`;
+      return `<div class="worker-node" data-key="${esc(worker.node_id || "")}"><span class="worker-dot ${worker.status === "idle" ? "idle" : "on"}"></span><div><b>${esc(worker.node_id || "Worker")}</b>${kind}<div class="tiny muted">${esc(current)} · heartbeat ${esc(lastSeen)}${done}</div></div><span class="st ${worker.status === "idle" ? "approved" : "pending"}">${esc(worker.status || "unknown")}</span></div>`;
+    }).join("") : `<p class="muted small">No active worker nodes. The master runs an embedded worker when MongoDB is connected (EMBEDDED_WORKER=1); start extra Render worker services for more capacity.</p>`);
     const pending = a.pending || [];
     setNum("a-pending", pending.length);
-    $("admin-pending").innerHTML = pending.length ? pending.map(reqRow).join("") : `<p class="muted small">No pending requests. 🎉</p>`;
+    setHTML("admin-pending", pending.length ? pending.map(reqRow).join("") : `<p class="muted small">No pending requests. 🎉</p>`);
     const c = a.counts || {};
-    $("a-counts").textContent = `✅ ${c.approved || 0} · ⏳ ${c.pending || 0} · ⌛ ${c.expired || 0}`;
+    setText("a-counts", `✅ ${c.approved || 0} · ⏳ ${c.pending || 0} · ⌛ ${c.expired || 0}`);
     const list = a.users.filter(userMatchesFilter);
-    $("admin-users").innerHTML = list.length ? list.map(userRow).join("") : `<p class="muted small">No users in this filter.</p>`;
+    setHTML("admin-users", list.length ? list.map(userRow).join("") : `<p class="muted small">No users in this filter.</p>`);
     const plans = state.config?.plans || [];
     const sel = $("adduser-plan");
     if (!sel.options.length) sel.innerHTML = plans.map((p) => `<option value="${esc(p.code)}" ${p.code === "1m" ? "selected" : ""}>${esc(p.label)}</option>`).join("");
     if (isOwner()) {
-      $("admin-recent").innerHTML = (a.recent || []).length ? a.recent.map(histRow).join("") : `<p class="muted small">Nothing yet.</p>`;
-      $("admin-audit").innerHTML = (a.audit || []).length ? a.audit.map(auditRow).join("") : `<p class="muted small">Nothing yet.</p>`;
+      setHTML("admin-recent", (a.recent || []).length ? a.recent.map(histRow).join("") : `<p class="muted small">Nothing yet.</p>`);
+      setHTML("admin-audit", (a.audit || []).length ? a.audit.map(auditRow).join("") : `<p class="muted small">Nothing yet.</p>`);
     }
   }
-  async function refreshAdmin() {
-    if (!isAdmin()) return;
-    try { state.admin = await api("/api/admin/overview"); renderAdmin(); }
-    catch (e) { toast(e.message, "err"); }
+  let adminInflight = null;
+  function refreshAdmin(loud) {
+    if (!isAdmin()) return Promise.resolve();
+    if (adminInflight) return adminInflight;                       // never stack overlapping requests
+    adminInflight = (async () => {
+      try { state.admin = await api("/api/admin/overview"); renderAdmin(); }
+      catch (e) { if (loud || !e.network) toast(e.message, "err"); }   // background hiccups stay silent
+      finally { adminInflight = null; }
+    })();
+    return adminInflight;
   }
   $("user-filters").addEventListener("click", (ev) => {
     const b = ev.target.closest("[data-f]"); if (!b) return;
@@ -494,7 +583,7 @@
       const on = t.id === "tab-" + name;
       t.classList.remove("enter-l", "enter-r");
       t.classList.toggle("hidden", !on);
-      if (on) animate(t, dir, 700);
+      if (on) animate(t, dir, 400);
     });
     document.querySelectorAll(".nav").forEach((n) => n.classList.toggle("active", n.dataset.tab === name));
     if (name === "admin") refreshAdmin();
@@ -503,22 +592,55 @@
   document.querySelectorAll(".nav").forEach((n) => n.onclick = () => setTab(n.dataset.tab));
 
   // ── Polling ───────────────────────────────────────────────────────────
-  async function refreshJobs() {
-    try { state.jobs = await api("/api/jobs"); renderJobs(); }
-    catch (e) { if (e.code === "locked") { clearTimeout(state.timer); return showLocked(e.data); } }
-    const hasLive = state.jobs && (state.jobs.active || state.jobs.queue.length);
-    clearTimeout(state.timer);
-    state.timer = setTimeout(refreshJobs, hasLive ? 2500 : 8000);
-    if (state.tab === "admin" && isAdmin()) refreshAdmin();
+  // One scheduler, one request in flight at a time. Fast while something is
+  // running, slow when idle, paused while the app is in the background and
+  // backing off (silently) when the server is unreachable. Renders are diffed
+  // (see setHTML) so a poll never causes visible flicker.
+  function schedulePoll(ms) { clearTimeout(state.timer); state.timer = setTimeout(() => refreshJobs(), ms); }
+  let jobsInflight = null;
+  function refreshJobs(immediate) {
+    if (jobsInflight) return jobsInflight;
+    if (document.hidden && !immediate) { clearTimeout(state.timer); return Promise.resolve(); }
+    jobsInflight = (async () => {
+      let next = POLL_IDLE, stop = false;
+      try {
+        state.jobs = await api("/api/jobs", { timeout: 15000 });
+        renderJobs(); state.pollFails = 0; state.lastPoll = Date.now();
+        if (state.jobs.active || (state.jobs.queue || []).length) next = POLL_LIVE;
+        if (state.tab === "admin" && isAdmin()) refreshAdmin();
+      } catch (e) {
+        if (e.code === "locked") { stop = true; showLocked(e.data); }
+        else if (e.code === "auth" || e.status === 401) { stop = true; sessionExpired(); }
+        else {
+          state.pollFails++;
+          next = Math.min(POLL_MAX_BACKOFF, POLL_IDLE * Math.pow(1.6, state.pollFails - 1));
+          if (state.pollFails === 3) toast("⚠️ Connection lost — retrying in background", "warn");
+        }
+      } finally { jobsInflight = null; }
+      if (stop) clearTimeout(state.timer); else if (!document.hidden) schedulePoll(next);
+    })();
+    return jobsInflight;
   }
   async function refreshMe() {
-    try { const r = await api("/api/me"); state.me = r.me; state.config = r.config; renderMe(); renderSettings(); } catch (_) {}
+    try { const r = await api("/api/me"); state.me = r.me; state.config = r.config; state.lastMe = Date.now(); renderMe(); renderSettings(); }
+    catch (e) { if (e.code === "auth" || e.status === 401) sessionExpired(); }
+  }
+  function sessionExpired() {
+    clearTimeout(state.timer); clearTimeout(state.lockedTimer);
+    showAuth("Session expired", "Your Telegram session for this dashboard has expired.\nClose the Mini App and open it again from the bot.");
+  }
+  function onForeground() {
+    if (state.me && !$("view-main").classList.contains("hidden")) {
+      refreshJobs(true);                                                  // returns the in-flight promise if any
+      if (Date.now() - state.lastMe > 30000) refreshMe();                 // profile rarely changes — don't hammer
+    } else if (!$("view-locked").classList.contains("hidden")) recheckAccess();
   }
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
-    if (state.me && !$("view-main").classList.contains("hidden")) { refreshJobs(); refreshMe(); }
-    else if (!$("view-locked").classList.contains("hidden")) recheckAccess();
+    if (document.hidden) { clearTimeout(state.timer); return; }        // pause polling in the background
+    onForeground();
   });
+  // Telegram ≥ 8.0 keeps minimised Mini Apps alive and reports activation separately
+  if (tg && tg.onEvent) { try { tg.onEvent("activated", onForeground); tg.onEvent("deactivated", () => clearTimeout(state.timer)); } catch (_) {} }
 
   // ── Manual refresh: ↻ button + pull-to-refresh ──
   async function refreshAll(source) {
@@ -527,9 +649,9 @@
     btn.classList.add("spin"); if (source === "pull") ptr.className = "ptr loading";
     const t0 = Date.now();
     try {
-      await Promise.all([refreshMe(), refreshJobs(), isAdmin() ? refreshAdmin() : null]);
-      await new Promise((r) => setTimeout(r, Math.max(0, 650 - (Date.now() - t0))));   // let the spinner be seen
-      animate($("tab-" + state.tab), "refreshed", 700);
+      await Promise.all([refreshMe(), refreshJobs(true), isAdmin() ? refreshAdmin(true) : null]);
+      await sleep(Math.max(0, 500 - (Date.now() - t0)));   // let the spinner be seen
+      if (state.pollFails) throw new Error("Server unreachable — will keep retrying");
       haptic("ok"); toast("✨ Updated", "ok");
     } catch (e) { toast(e.message || "Refresh failed", "err"); haptic("err"); }
     finally {
@@ -610,7 +732,8 @@
       haptic("ok"); toast("✅ Access granted", "ok"); boot(r);
     } catch (e) {
       if (e.code === "locked") { showLocked(e.data); if (manual) { toast("Still waiting…"); haptic("warn"); } }
-      else if (e.code === "auth" || e.status === 401) show("auth");
+      else if (e.code === "auth" || e.status === 401) showAuth();
+      else if (e.network && !manual) { clearTimeout(state.lockedTimer); state.lockedTimer = setTimeout(recheckAccess, 20000); }  // quiet retry
       else { $("locked-error").textContent = e.message; $("locked-error").classList.remove("hidden"); haptic("err"); }
     }
   }
@@ -638,9 +761,11 @@
   // ── Boot ──────────────────────────────────────────────────────────────
   function boot(r) {
     clearTimeout(state.lockedTimer);
-    state.me = r.me; state.config = r.config;
+    state.me = r.me; state.config = r.config; state.lastMe = Date.now();
     renderMe(); renderSettings(); show("main");
-    refreshJobs().then(() => {
+    const firstBoot = !state.booted; state.booted = true;
+    refreshJobs(true).then(() => {
+      if (!firstBoot) return;
       const m = location.hash.match(/job=([A-Za-z0-9_-]+)/);
       if (m) openSheet(m[1]);
       if (/admin/.test(location.hash) && isAdmin()) setTab("admin");
@@ -648,17 +773,42 @@
     if (isAdmin()) refreshAdmin();
     haptic("soft");
   }
-  async function start() {
-    try { boot(await api("/api/me")); }
-    catch (e) {
-      if (e.code === "locked") return showLocked(e.data);
-      if (e.code === "auth" || e.status === 401) {
-        show("auth");
-        try { const h = await fetch("/health").then((x) => x.json()); if (h.bot) { $("auth-link").href = "https://t.me/" + h.bot; $("auth-link").classList.remove("hidden"); } } catch (_) {}
-        return;
-      }
-      show("auth"); toast(e.message, "err");
-    }
+  async function showAuth(title, text) {
+    setText("auth-title", title || "Open from Telegram");
+    if (text) setText("auth-text", text);
+    show("auth");
+    try { const h = await fetch("/health", { cache: "no-store" }).then((x) => x.json()); if (h.bot) { $("auth-link").href = "https://t.me/" + h.bot; $("auth-link").classList.remove("hidden"); } } catch (_) {}
   }
+  function setLoading(msg, failed) {
+    const v = $("view-loading"); v.classList.toggle("failed", !!failed);
+    setText("loading-status", msg); $("btn-retry").classList.toggle("hidden", !failed);
+  }
+  // Free-tier hosts (Render) put the server to sleep; the first request after a
+  // while can take 30-60 s or fail with 502/503 while it boots. Keep the skeleton
+  // up, tell the user what is going on and retry with a gentle backoff instead
+  // of dumping them on a misleading error screen.
+  const BOOT_DELAYS = [1200, 2000, 3000, 5000, 8000, 8000, 10000, 10000, 15000, 15000];
+  let starting = false;
+  async function start() {
+    if (starting) return; starting = true;
+    show("loading");
+    try {
+      for (let attempt = 0; ; attempt++) {
+        setLoading(attempt === 0 ? "Connecting…" : attempt < 3 ? "Waking up the server…" : `Still waking up the server… (${attempt + 1})`);
+        try { return boot(await api("/api/me", { timeout: attempt === 0 ? 12000 : 25000 })); }
+        catch (e) {
+          if (e.code === "locked") return showLocked(e.data);
+          if (e.code === "auth" || e.status === 401) return showAuth();
+          if (!e.network && e.status && e.status < 500 && e.status !== 408 && e.status !== 429)
+            return setLoading("⚠️ " + e.message, true);
+          if (attempt >= BOOT_DELAYS.length)
+            return setLoading("⚠️ Could not reach the server. Check your connection and tap Retry.", true);
+          await sleep(BOOT_DELAYS[attempt]);
+        }
+      }
+    } finally { starting = false; }
+  }
+  $("btn-retry").onclick = () => { haptic("medium"); start(); };
+  window.addEventListener("online", () => { if (!state.booted && !starting) start(); else if (state.booted) onForeground(); });
   start();
 })();

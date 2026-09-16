@@ -1,6 +1,6 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v6.2 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
+**v6.3 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
 
 The master process (Pyrogram + aiohttp) accepts Telegram updates and — by default —
 also runs a translation worker in-process, so **one free Render service is a complete
@@ -59,6 +59,7 @@ deliver the result as TXT, DOCX or EPUB — split into parts of any size you lik
   **Storage guard**: every 10 min (and after bursts of jobs) the janitor reads `dbStats`; if the DB exceeds 80 % of `DB_BUDGET_MB` or `jobs` exceeds `DB_MAX_JOB_DOCS`, old history is pruned (per-user `HISTORY_LIMIT` → global cap → halve cap until under budget). Usage is shown in `/stats`, the Mini App owner panel and `/health`
 - **Telegram Mini App** (`/app`) – Telegram-themed dashboard: ⚙️ settings (language / format / split), ▶️ live progress with ETA, 📋 queue with cancel, 🕘 history, 🎫 my access card + expiry banner, 🔒 locked screen with **Request Access** / pending status / withdraw (auto re-checks while pending), 👑 admin panel (pending requests with one-tap plans, user list with status filters, per-user sheet: approve / extend / custom duration / reject / revoke / ban / unban / promote, audit log, broadcast). Uploads can be configured from the Mini App via “📱 Configure in Mini App”. `initData` is HMAC-verified server-side (24 h max age)
 - **Mini App UX polish** – skeleton shimmer while loading (no blank splash), ↻ refresh button + pull-to-refresh gesture (`disableVerticalSwipes` so Telegram doesn't collapse the app), animated tab slides / staggered card entrances / number bumps, slide-up bottom sheets with grabber, and rich haptics (`HapticFeedback` impact / selection / notification, `navigator.vibrate` fallback outside Telegram). Honours `prefers-reduced-motion`
+- **Mini App reliability (v6.3)** – built for a free-tier host that sleeps: the boot loop keeps the skeleton up and retries with backoff (“Waking up the server…”) instead of dumping users on the *Open from Telegram* screen when the backend is cold, 5xx or unreachable; a ↻ **Retry** button appears only after a hard failure. Every request has a timeout, background polls never overlap, pause while the app is hidden/minimised and back off silently when the server is down (one quiet toast, no error spam). Renders are **DOM-morphed** — polls patch only what changed (rows keyed by id), so nothing flickers, progress bars animate smoothly and taps are never lost; settings taps highlight optimistically and roll back on error. `index.html` is served `no-store` with hashed asset URLs (`/app/app.js?v=<hash>`, `immutable`), so a Telegram WebView can never combine a fresh page with a stale script after a deploy. Fonts and scripts load non-blocking, 401s show a clear *Session expired* screen
 - **Hierarchical reply keyboard** – 📱 Mini App · 🛠 Tools · ⚙️ Settings · 👑 Admin (owner) sub-menus. The *📱 Mini App* keyboard button behaves like `/app`: the bot replies with a message carrying an inline **📱 Open Mini App** button (fresh link, visible in chat)
 - **Render-ready** – binds `$PORT` with a `/health` endpoint, self keep-alive ping so the free instance doesn't sleep, graceful SIGTERM handling (users are told when a redeploy interrupts their job)
 - **Worker monitoring** – the owner Admin tab shows live worker nodes, heartbeat age, current job and online count.
@@ -179,7 +180,9 @@ Or use the offline harness (no Telegram connection, fake jobs + seeded users in 
 tests/devctl.sh start owner   8080   # admin panel with pending requests
 tests/devctl.sh start locked  8083   # "Request Access" screen
 tests/devctl.sh start pending 8081   # waiting-for-approval screen  (also: admin · user · expired · rejected · banned)
-python tests/test_api_flow.py 8080   # exercises every /api/admin/users action + the locked-user flow
+python tests/test_api_flow.py 8080 8083   # exercises every /api/admin/users action + the locked-user flow (fresh harnesses!)
+python tests/test_miniapp_ui.py 8080 8081 # headless Chromium: asset versioning, boot, DOM morphing, offline/Retry, locked view
+                                          # (pip install playwright && python -m playwright install chromium)
 tests/devctl.sh stopall
 ```
 
@@ -218,6 +221,10 @@ All endpoints expect `Authorization: tma <initData>` (Telegram WebApp `initData`
 | POST   | `/api/admin/broadcast`  | Owner: `{text}` → all approved users        |
 
 Static files live in `miniapp/` (`index.html`, `style.css`, `app.js` — no build step).
+`index.html` is served with `Cache-Control: no-store` and the literal `__ASSET_V__` in its asset URLs replaced by a
+short hash of `app.js` + `style.css` (+ `VERSION`); `/app/<file>?v=<hash>` responses are `immutable` for a year,
+bare `/app/<file>` requests get `max-age=300, must-revalidate`. Deploying new front-end files therefore invalidates
+every client automatically — no manual version bump needed.
 
 ## 🔒 Security
 
