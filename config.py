@@ -46,30 +46,12 @@ def env_int_list(name: str) -> List[int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔐 BUILT-IN CREDENTIALS  (single source of truth — nothing has to be typed
-#    into Render / Docker / .env any more; an env var still overrides these)
-# ═══════════════════════════════════════════════════════════════════════════
-# https://my.telegram.org → API development tools (app "nitesh")
-DEFAULT_API_ID = 36681596
-DEFAULT_API_HASH = "bece5a5cb8d1abc08b644410b6e85d5e"
-# @BotFather → @Blackrose_2_bot
-DEFAULT_BOT_TOKEN = "8795048332:AAGic2dyjDejE3S9AIlyfeCM-HejUDOBKPI"
-# Telegram ID of the bot owner (approves everyone else; already stored as owner in the DB)
-DEFAULT_OWNER_ID = 6069200310
-# MongoDB Atlas free tier (M0) — db user bhuimharniteshbhuimhar_db_user
-DEFAULT_MONGO_URI = (
-    "mongodb+srv://bhuimharniteshbhuimhar_db_user:nitesh9939"
-    "@nitesh99390.qbwrf1c.mongodb.net/?appName=Nitesh99390&retryWrites=true&w=majority"
-)
-DEFAULT_MONGO_DB = "noveltranslator"
-
-# ═══════════════════════════════════════════════════════════════════════════
 # 🔑 TELEGRAM & IDENTITY
 # ═══════════════════════════════════════════════════════════════════════════
-API_ID = env_int("API_ID", DEFAULT_API_ID)
-API_HASH = env("API_HASH") or DEFAULT_API_HASH
-BOT_TOKEN = env("BOT_TOKEN") or DEFAULT_BOT_TOKEN
-OWNER_ID = env_int("OWNER_ID", DEFAULT_OWNER_ID)
+API_ID = env_int("API_ID", 0)
+API_HASH = env("API_HASH")
+BOT_TOKEN = env("BOT_TOKEN")
+OWNER_ID = env_int("OWNER_ID", 0)
 AUTHORIZED_USERS = env_int_list("AUTHORIZED_USERS")
 ADMIN_USERS = env_int_list("ADMIN_USERS")
 PUBLIC_MODE = env_bool("PUBLIC_MODE", False)
@@ -82,14 +64,9 @@ LEGACY_USERS = env("LEGACY_USERS", "keep").lower()
 # 📋 BOT IDENTITY & VERSIONING
 # ═══════════════════════════════════════════════════════════════════════════
 BOT_NAME = env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "6.1-master-worker"
+VERSION = "6.0-master-worker"
 SERVICE_ROLE = env("SERVICE_ROLE", "master").lower()  # "master" or "worker"
 WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
-# The master also runs a translation worker in-process by default, so a single
-# free Render service is a complete deployment. Extra worker services simply
-# add more parallel capacity. Set EMBEDDED_WORKER=0 to make the master polling-only.
-EMBEDDED_WORKER = env_bool("EMBEDDED_WORKER", True)
-AUDIT_LIMIT = 300  # audit entries kept in RAM / DB
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ⚙️ TRANSLATION SETTINGS
@@ -119,10 +96,13 @@ KEEP_ALIVE_INTERVAL = max(60, env_int("KEEP_ALIVE_INTERVAL", 600))
 # ═══════════════════════════════════════════════════════════════════════════
 # 🗄 MONGODB & JOB QUEUE
 # ═══════════════════════════════════════════════════════════════════════════
-MONGO_URI = env("MONGO_URI") or env("MONGODB_URI") or env("DATABASE_URL") or DEFAULT_MONGO_URI
+MONGO_URI = env("MONGO_URI") or env("MONGODB_URI") or env("DATABASE_URL") or (
+    "mongodb+srv://bhuimharniteshbhuimhar_db_user:nitesh9939"
+    "@nitesh99390.qbwrf1c.mongodb.net/?appName=Nitesh99390&retryWrites=true&w=majority"
+)
 if MONGO_URI.lower() in {"0", "off", "none", "memory", "disabled"}:
     MONGO_URI = ""
-MONGO_DB = env("MONGO_DB", DEFAULT_MONGO_DB)
+MONGO_DB = env("MONGO_DB", "noveltranslator")
 HISTORY_LIMIT = max(5, min(env_int("HISTORY_LIMIT", 30), 100))
 DB_BUDGET_MB = max(50, min(env_int("DB_BUDGET_MB", 400), 512))
 DB_MAX_JOB_DOCS = max(200, env_int("DB_MAX_JOB_DOCS", 3000))
@@ -131,11 +111,6 @@ DB_JOB_TTL_DAYS = max(7, min(env_int("DB_JOB_TTL_DAYS", 60), 365))
 # Worker polling & heartbeat
 WORKER_HEARTBEAT_INTERVAL = max(10, env_int("WORKER_HEARTBEAT_INTERVAL", 30))
 WORKER_POLL_INTERVAL = max(1, env_int("WORKER_POLL_INTERVAL", 3))
-# A "running" job whose worker heartbeat is older than this is handed back to the queue
-WORKER_STALE_AFTER = max(60, env_int("WORKER_STALE_AFTER", 150))
-JOB_MAX_REQUEUES = max(0, env_int("JOB_MAX_REQUEUES", 2))
-# Finished queue documents are kept this long for the Mini App, then pruned
-QUEUE_DONE_KEEP_H = max(1, env_int("QUEUE_DONE_KEEP_H", 24))
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 📱 MINI APP & WEB INTERFACE
@@ -232,8 +207,8 @@ log = logging.getLogger("noveltranslator")
 BOOT_TS = time.time()
 
 
-def validate_config(require_telegram: bool = True, role: str = SERVICE_ROLE) -> None:
-    """Validate the effective configuration (env vars merged with the built-in defaults)."""
+def validate_config(require_telegram: bool = True) -> None:
+    """Validate required environment variables."""
     problems = []
     if require_telegram and not API_ID:
         problems.append("API_ID")
@@ -241,7 +216,7 @@ def validate_config(require_telegram: bool = True, role: str = SERVICE_ROLE) -> 
         problems.append("API_HASH")
     if require_telegram and (not BOT_TOKEN or ":" not in BOT_TOKEN):
         problems.append("BOT_TOKEN")
-    if require_telegram and role == "master" and not OWNER_ID and not PUBLIC_MODE:
+    if require_telegram and SERVICE_ROLE == "master" and not OWNER_ID and not PUBLIC_MODE:
         problems.append("OWNER_ID")
     if problems:
-        raise RuntimeError("Missing or invalid configuration: " + ", ".join(problems))
+        raise RuntimeError("Missing or invalid environment variables: " + ", ".join(problems))

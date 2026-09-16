@@ -1,10 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render Blueprint — NovelTranslator PRO v6.1 (master + embedded worker · MongoDB GridFS)
-#  Dashboard → New → Blueprint → pick this repo.
-#  Credentials are built into config.py; the env vars below only OVERRIDE them.
-#  The master service alone is a complete deployment (EMBEDDED_WORKER=1).
-#  The second service is an OPTIONAL extra worker for parallel capacity —
-#  delete it to stay within a single free instance.
+#  Render Blueprint — NovelTranslator PRO v6 (master + worker · MongoDB GridFS)
+#  Dashboard → New → Blueprint → pick this repo → fill the secret env vars.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
@@ -50,14 +46,6 @@ services:
         value: noveltranslator
       - key: SERVICE_ROLE
         value: master
-      - key: EMBEDDED_WORKER      # "0" → polling-only master (needs a worker service)
-        value: "1"
-      - key: WORKER_STALE_AFTER   # seconds without heartbeat before a job is re-queued
-        value: "150"
-      - key: JOB_MAX_REQUEUES
-        value: "2"
-      - key: QUEUE_DONE_KEEP_H
-        value: "24"
       # Free-tier storage guard (Atlas M0 = 512 MB): prune old job history above 80 % of the budget
       - key: DB_BUDGET_MB
         value: "400"
@@ -83,7 +71,6 @@ services:
       - key: KEEP_ALIVE_INTERVAL   # seconds (free tier sleeps after 15 min idle)
         value: "600"
 
-  # ── OPTIONAL extra worker (parallel capacity). Safe to delete. ──
   - type: web
     name: noveltranslator-worker
     runtime: python
