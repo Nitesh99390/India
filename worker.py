@@ -347,7 +347,8 @@ class TranslationWorker:
         """Standalone entrypoint: own client, own DB connection, own health server."""
         validate_config(require_telegram=True, role="worker")
         if not await self.db.connect():
-            raise SystemExit("worker needs MongoDB (MONGO_URI) — the queue lives there")
+            raise SystemExit("worker could not connect to MongoDB — the queue lives there. "
+                             "Check the connection error above (Atlas Network Access must allow 0.0.0.0/0).")
         await self.start_health()
         await self.client.start()
         me = await self.client.get_me()

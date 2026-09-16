@@ -1,10 +1,10 @@
 """Shared configuration for NovelTranslator PRO master and workers (v6.2 Master-Worker).
 
-Everything is read from environment variables (``.env`` is loaded when python-dotenv
-is installed).  Telegram credentials and the owner ID are *never* hard-coded here —
-they must come from the environment (Render dashboard / Docker / ``.env``).  Only the
-MongoDB connection falls back to the project's own Atlas free-tier cluster so that a
-fresh deploy is persistent out of the box.
+Everything can be overridden from environment variables (``.env`` is loaded when
+python-dotenv is installed), but **every required value ships with a working
+built-in default** — Telegram credentials, owner ID and the MongoDB cluster — so a
+fresh Render/Docker deploy of *either* service (master or worker) starts with zero
+configuration.  Set an env var only when you want to change something.
 """
 
 from __future__ import annotations
@@ -53,14 +53,19 @@ def env_int_list(name: str) -> List[int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔑 TELEGRAM & IDENTITY  (environment only — secrets never live in the repo)
+# 🔑 TELEGRAM & IDENTITY  (built-in defaults — env vars override when present)
 # ═══════════════════════════════════════════════════════════════════════════
 # https://my.telegram.org → API development tools · @BotFather → /newbot
-API_ID = env_int("API_ID", 0)
-API_HASH = env("API_HASH")
-BOT_TOKEN = env("BOT_TOKEN")
+DEFAULT_API_ID = 36681596
+DEFAULT_API_HASH = "bece5a5cb8d1abc08b644410b6e85d5e"
+DEFAULT_BOT_TOKEN = "8795048332:AAGic2dyjDejE3S9AIlyfeCM-HejUDOBKPI"
 # Numeric Telegram ID of the bot owner (approves everyone else). Send /id to the bot.
-OWNER_ID = env_int("OWNER_ID", 0)
+DEFAULT_OWNER_ID = 6069200310
+
+API_ID = env_int("API_ID", DEFAULT_API_ID) or DEFAULT_API_ID
+API_HASH = env("API_HASH") or DEFAULT_API_HASH
+BOT_TOKEN = env("BOT_TOKEN") or DEFAULT_BOT_TOKEN
+OWNER_ID = env_int("OWNER_ID", DEFAULT_OWNER_ID) or DEFAULT_OWNER_ID
 AUTHORIZED_USERS = env_int_list("AUTHORIZED_USERS")
 ADMIN_USERS = env_int_list("ADMIN_USERS")
 PUBLIC_MODE = env_bool("PUBLIC_MODE", False)
@@ -243,5 +248,6 @@ def validate_config(require_telegram: bool = True, role: str = SERVICE_ROLE) -> 
     if require_telegram and role == "master" and not OWNER_ID and not PUBLIC_MODE:
         problems.append("OWNER_ID")
     if problems:
-        raise RuntimeError("Missing or invalid environment variables: " + ", ".join(problems)
-                           + " — set them in the Render dashboard → Environment (or a local .env).")
+        raise RuntimeError("Missing or invalid configuration: " + ", ".join(problems)
+                           + " — the built-in defaults were overridden by an env var with a bad value; "
+                             "fix or remove it in the Render dashboard → Environment (or .env).")
