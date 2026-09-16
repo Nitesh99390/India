@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import html
 import json
 import re
 import time
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import parse_qsl
 
 import aiohttp
 import docx
@@ -20,7 +18,6 @@ from ebooklib import epub
 
 from config import (
     CHUNK_SIZE,
-    EXPANSION,
     MAX_RETRIES,
     REQUEST_TIMEOUT,
     log,
@@ -457,6 +454,5 @@ class TranslationEngine:
 
 async def close_http() -> None:
     """Close shared HTTP session."""
-    global _HTTP_SESSION
     if _HTTP_SESSION and not _HTTP_SESSION.closed:
         await _HTTP_SESSION.close()
