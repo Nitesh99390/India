@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render Blueprint — NovelTranslator PRO v6.2 (master + embedded worker · MongoDB GridFS)
+#  Render Blueprint — NovelTranslator PRO v6.4 (master + embedded worker · MongoDB GridFS)
 #  Dashboard → New → Blueprint → pick this repo → Apply. NOTHING to fill in:
 #  API_ID · API_HASH · BOT_TOKEN · OWNER_ID · MONGO_URI all have working
 #  built-in defaults in config.py (set an env var only to override).
@@ -58,6 +58,8 @@ services:
         value: "2"
       - key: QUEUE_DONE_KEEP_H
         value: "24"
+      - key: ORPHAN_FILE_AGE_H    # hours before an unreferenced GridFS upload is deleted
+        value: "2"
       # Free-tier storage guard (Atlas M0 = 512 MB): prune old job history above 80 % of the budget
       - key: DB_BUDGET_MB
         value: "400"

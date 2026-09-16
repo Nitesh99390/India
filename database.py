@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,8 +18,8 @@ except ImportError:  # pragma: no cover
     AsyncIOMotorClient = None
     AsyncIOMotorGridFSBucket = None
 
-from config import (DB_JOB_TTL_DAYS, JOB_MAX_REQUEUES, MONGO_DB, MONGO_URI, QUEUE_DONE_KEEP_H,
-                    WORKER_HEARTBEAT_INTERVAL, WORKER_STALE_AFTER)
+from config import (DB_JOB_TTL_DAYS, JOB_MAX_REQUEUES, MONGO_DB, MONGO_URI, ORPHAN_FILE_AGE_H,
+                    QUEUE_DONE_KEEP_H, WORKER_HEARTBEAT_INTERVAL, WORKER_STALE_AFTER)
 
 FINISHED = ("done", "failed", "cancelled")
 log = logging.getLogger("database")
@@ -190,12 +191,61 @@ class MongoDatabase:
         return touched
 
     async def prune_finished(self) -> int:
-        """Drop finished queue documents older than QUEUE_DONE_KEEP_H (history lives in `jobs`)."""
+        """Drop finished queue documents older than QUEUE_DONE_KEEP_H (history lives in `jobs`).
+        Any GridFS source still attached to such a document is removed first."""
         if self.db is None:
             return 0
         cutoff = time.time() - QUEUE_DONE_KEEP_H * 3600
-        result = await self.db.jobs_queue.delete_many({"status": {"$in": list(FINISHED)}, "updated_at": {"$lt": cutoff}})
+        query = {"status": {"$in": list(FINISHED)}, "updated_at": {"$lt": cutoff}}
+        async for doc in self.db.jobs_queue.find(query, {"file_id": 1}):
+            await self.delete_file(str(doc.get("file_id") or ""))
+        result = await self.db.jobs_queue.delete_many(query)
         return int(result.deleted_count)
+
+    async def prune_orphan_files(self, max_age_h: float = ORPHAN_FILE_AGE_H) -> Dict[str, Any]:
+        """Delete GridFS sources that no *live* (queued/running) job references.
+
+        Sources become orphans when the options wizard is abandoned (the upload
+        happens before the job is enqueued), when a master restarts mid-wizard, or
+        when a worker dies between finishing a job and deleting its file. Only files
+        older than ``max_age_h`` are touched so an upload whose wizard is still open
+        (PENDING_TTL = 30 min) is never removed under the user's feet.
+        Returns ``{"files": n, "bytes": b}``.
+        """
+        stats = {"files": 0, "bytes": 0}
+        if self.db is None or self.files is None:
+            return stats
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0.0, max_age_h))
+        live: set[str] = set()
+        async for doc in self.db.jobs_queue.find({"status": {"$in": ["queued", "running"]}}, {"file_id": 1}):
+            if doc.get("file_id"):
+                live.add(str(doc["file_id"]))
+        async for f in self.db["documents.files"].find({"uploadDate": {"$lt": cutoff}}, {"length": 1}):
+            if str(f["_id"]) in live:
+                continue
+            try:
+                await self.files.delete(f["_id"])
+            except Exception as e:
+                log.debug("orphan delete %s: %s", f["_id"], e)
+                continue
+            stats["files"] += 1
+            stats["bytes"] += int(f.get("length", 0) or 0)
+        if stats["files"]:
+            log.info("pruned %d orphaned GridFS file(s), %.1f MB", stats["files"], stats["bytes"] / 1e6)
+        return stats
+
+    async def storage_stats(self) -> Dict[str, Any]:
+        """GridFS usage summary for /health and the admin panel."""
+        if self.db is None:
+            return {"files": 0, "mb": 0.0}
+        try:
+            rows = await self.db["documents.files"].aggregate(
+                [{"$group": {"_id": None, "n": {"$sum": 1}, "bytes": {"$sum": "$length"}}}]).to_list(1)
+        except Exception:
+            return {"files": 0, "mb": 0.0}
+        if not rows:
+            return {"files": 0, "mb": 0.0}
+        return {"files": int(rows[0].get("n", 0)), "mb": round(int(rows[0].get("bytes", 0)) / 1e6, 2)}
 
     async def cancel_job(self, job_id: str, user_id: int, owner: bool = False) -> bool:
         if self.db is None:

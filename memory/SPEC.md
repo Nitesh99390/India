@@ -24,7 +24,7 @@ DOCX or EPUB parts back to the user.
 3. Confirming options writes a queued job to MongoDB; no Telegram polling or heavy translation runs on the master.
 4. A worker atomically claims the oldest queued job, downloads to a temporary directory, translates and sends progress edits/output documents.
 5. Worker marks the job complete/failed/cancelled, writes history, removes the GridFS source, and cleans temporary files. On shutdown a running job is re-queued (source kept).
-6. Every worker's `recover_loop` (or the master janitor when no worker is embedded) re-queues `running` jobs whose heartbeat is older than `WORKER_STALE_AFTER`, failing them after `JOB_MAX_REQUEUES`.
+6. Every worker's `recover_loop` (or the master janitor when no worker is embedded) re-queues `running` jobs whose heartbeat is older than `WORKER_STALE_AFTER`, failing them after `JOB_MAX_REQUEUES`. The same loop runs `prune_finished()` (deleting any GridFS source still attached) and `prune_orphan_files()` (v6.4): GridFS files older than `ORPHAN_FILE_AGE_H` (default 2 h, min 1 h) that no `queued`/`running` job references are deleted. `Job.cleanup()` on the master deletes the upload of a wizard that is discarded or expires before it is enqueued. `/health` exposes `gridfs: {files, mb}`.
 7. Cancel (`/cancel`, inline button, Mini App) updates the persisted queue document; the worker observes it via `touch_job` on the next progress tick and stops.
 8. Admin Mini App reads `/api/admin/overview` and displays active worker heartbeats, embedded badge and per-node counters; `/health` reports `master+worker`.
 

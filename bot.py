@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║        📚 NovelTranslator PRO  —  Telegram Document Translation Bot       ║
-║      v6.2  ·  Master + embedded/extra Workers · GridFS · Mini App        ║
+║      v6.4  ·  Master + embedded/extra Workers · GridFS · Mini App        ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  • Approval-based access (no password) → users request, owner/admins    ║
 ║    approve for 1 week / month / year / lifetime / custom; auto-expiry,  ║
@@ -1635,6 +1635,16 @@ class Job:
         except Exception:
             pass
         shutil.rmtree(self.out_dir, ignore_errors=True)
+        # A wizard that never reached the queue leaves its upload in GridFS
+        # (the source is uploaded *before* the options are chosen). Drop it now
+        # instead of waiting for the orphan sweep. Enqueued jobs are owned by
+        # the worker, which deletes the file when it finishes.
+        if self.status == "pending" and self.gridfs_id and QUEUE_REPO:
+            fid, self.gridfs_id = self.gridfs_id, ""
+            try:
+                asyncio.get_running_loop().create_task(QUEUE_REPO.delete_file(fid))
+            except RuntimeError:            # no running loop (shutdown) → orphan sweep handles it
+                pass
 
 
 PENDING: Dict[str, Job] = {}          # wizard not finished yet
@@ -1803,6 +1813,7 @@ async def janitor():
             try:
                 await QUEUE_REPO.requeue_stale()
                 await QUEUE_REPO.prune_finished()
+                await QUEUE_REPO.prune_orphan_files()
             except Exception as e:
                 log.debug("queue maintenance: %s", e)
         for jid, job in list(PENDING.items()):
@@ -3993,9 +4004,11 @@ async def miniapp_file(request: web.Request) -> web.Response:
 # ═══════════════════════════════════════════════════════════════════════════
 async def health(_request: web.Request) -> web.Response:
     workers = []
+    gridfs = {"files": 0, "mb": 0.0}
     if QUEUE_REPO:
         try:
             workers = await QUEUE_REPO.workers()
+            gridfs = await QUEUE_REPO.storage_stats()
         except Exception:
             workers = []
     return web.json_response({
@@ -4011,6 +4024,7 @@ async def health(_request: web.Request) -> web.Response:
         "db": "mongodb" if store.connected else "memory",
         "db_size_mb": store.db_size_mb if store.connected else 0,
         "db_budget_mb": DB_BUDGET_MB if store.connected else 0,
+        "gridfs": gridfs,
         "mini_app": bool(MINI_APP_URL),
         "users": len(store.users),
         "access": store.count_by_status(),
