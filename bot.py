@@ -23,7 +23,6 @@ import calendar
 import hashlib
 import hmac
 import html
-import io
 import json
 import logging
 import os
@@ -31,7 +30,6 @@ import random
 import re
 import shutil
 import sys
-import tempfile
 import time
 import uuid
 from collections import deque
@@ -97,17 +95,16 @@ except ImportError:  # pragma: no cover
 # ═══════════════════════════════════════════════════════════════════════════
 from config import (  # noqa: E402
     ADMIN_USERS, AUDIT_LIMIT, AUTHORIZED_USERS, API_HASH, API_ID, BACKUP_GROUP_ID, BASE_DIR,
-    BOOT_TS, BOT_NAME, BOT_TOKEN, CHUNK_SIZE, CONCURRENCY_LIMIT, DB_BUDGET_MB, DB_JOB_TTL_DAYS,
+    BOT_NAME, BOT_TOKEN, CHUNK_SIZE, CONCURRENCY_LIMIT, DB_BUDGET_MB, DB_JOB_TTL_DAYS,
     DB_MAX_JOB_DOCS, DEFAULT_APPROVAL, DEFAULT_FORMAT, DEFAULT_LANG, DEFAULT_SPLIT_KB, EDIT_INTERVAL,
     EMBEDDED_WORKER, EXPANSION, EXPIRY_REMINDER_DAYS, HISTORY_LIMIT, INBOX_DIR, INIT_DATA_MAX_AGE,
     KEEP_ALIVE, KEEP_ALIVE_INTERVAL, LANGUAGES, LEGACY_USERS, MAX_INPUT_MB, MAX_JOBS_PER_USER,
     MAX_RETRIES, MAX_SPLIT_KB, MINIAPP_DEV_USER, MINI_APP_DIR, MINI_APP_URL, MIN_SPLIT_KB, MONGO_DB,
-    MONGO_URI, OUTPUT_FORMATS, OWNER_ID, PENDING_TTL, PORT, PUBLIC_MODE, PUBLIC_URL,
-    QUEUE_DONE_KEEP_H, REJECT_COOLDOWN_H, RENDER_EXTERNAL_URL, REQUEST_TIMEOUT, SPLIT_PRESETS,
-    STORAGE_DIR, VERSION, WORKER_NODE_ID, WORKER_STALE_AFTER, env as _env,
+    MONGO_URI, OUTPUT_FORMATS, OWNER_ID, PENDING_TTL, PORT, PUBLIC_MODE,
+    REJECT_COOLDOWN_H, RENDER_EXTERNAL_URL, REQUEST_TIMEOUT, SPLIT_PRESETS,
+    STORAGE_DIR, VERSION, env as _env,
     validate_config as _validate_config,
 )
-import config as _cfg  # noqa: E402
 
 # PDF input only when pypdf is importable (config lists it unconditionally)
 INPUT_EXTS = {".epub", ".txt", ".docx"} | ({".pdf"} if HAS_PDF else set())
@@ -2653,7 +2650,7 @@ def text_owner() -> str:
 async def cmd_stats(_, m: Message):
     await m.reply(text_owner(), reply_markup=back_home_kb())
 
-def _parse_target(m: Message, usage: str) -> Optional[int]:
+def _parse_target(m: Message, _usage: str = "") -> Optional[int]:
     """`/cmd <id>` or `/cmd` as a reply to a forwarded message → user id."""
     if len(m.command) > 1 and m.command[1].lstrip("-").isdigit():
         return int(m.command[1])
