@@ -1,11 +1,17 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v6.0 · Master-worker processing + GridFS + approval-based access, built for the Render.com free tier.**
+**v6.2 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
 
-The master process (Pyrogram + aiohttp) accepts Telegram updates while one or
-more stateless workers translate whole
-documents (EPUB / TXT / DOCX / PDF) into 25 languages and delivers the result
-as TXT, DOCX or EPUB — split into parts of any size you like.
+The master process (Pyrogram + aiohttp) accepts Telegram updates and — by default —
+also runs a translation worker in-process, so **one free Render service is a complete
+deployment**. Extra stateless `worker.py` services simply add parallel capacity.
+Workers translate whole documents (EPUB / TXT / DOCX / PDF) into 25 languages and
+deliver the result as TXT, DOCX or EPUB — split into parts of any size you like.
+
+> 🔐 **Secrets stay out of the repo.** `config.py` is the single source of truth for
+> configuration, but Telegram `API_ID` / `API_HASH` / `BOT_TOKEN` and `OWNER_ID` are read
+> **only** from environment variables (Render dashboard, Docker `-e`, or a local `.env`).
+> The bot refuses to start and tells you exactly which variable is missing.
 
 > 🗄 **MongoDB persistence out of the box.** The bot ships with the project's own
 > MongoDB Atlas free-tier (M0, 512 MB) connection string baked in, so users, settings,
@@ -60,17 +66,29 @@ as TXT, DOCX or EPUB — split into parts of any size you like.
 ## 🧭 Master-worker architecture
 
 - `master.py` is the only Telegram polling process. It owns all message and callback handlers, the Mini App API, and document intake.
-- `config.py` centralises environment variables and deployment constants.
-- `database.py` owns Motor, GridFS, atomic `jobs_queue` claims, worker heartbeats and job persistence.
+- **Embedded worker (v6.1+)** – with `EMBEDDED_WORKER=1` (default) the master also creates a `TranslationWorker(client=app, db=…)` and runs it as a background task using the *same* Pyrogram client. Set `EMBEDDED_WORKER=0` for a polling-only master when you run dedicated workers.
+- `config.py` centralises environment parsing (`.env` supported), validation and deployment constants — no secrets are committed.
+- `database.py` owns Motor, GridFS, atomic `jobs_queue` claims, job heartbeats, stale-job recovery (`requeue_stale`), finished-job pruning, queue positions and worker heartbeats.
 - `translator.py` contains extraction, chunking, Google Translate/fallback logic and output writers.
-- `worker.py` never calls Telegram polling or `app.run()`. Each worker claims one queued job with `find_one_and_update`, downloads the source from GridFS to an ephemeral folder, translates it, sends progress edits and output documents, then deletes the GridFS file.
+- `worker.py` never calls Telegram polling or `app.run()`. Each worker claims one queued job with `find_one_and_update`, downloads the source from GridFS to an ephemeral folder, translates it, sends throttled progress edits (progress bar · part/chunk · speed · ETA) and the output documents, then deletes the GridFS file.
 
-All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `BOT_TOKEN`. Add more Render worker services with unique `WORKER_NODE_ID` values; the admin Mini App shows nodes whose heartbeat was received within the last 90 seconds.
+### Reliability (v6.1+)
+
+| Feature | How it works |
+|---------|--------------|
+| Job heartbeat | The worker refreshes `jobs_queue.heartbeat` on every progress tick and heartbeat interval. |
+| Stale recovery | A `running` job whose heartbeat is older than `WORKER_STALE_AFTER` (150 s) is handed back to the queue (max `JOB_MAX_REQUEUES` = 2 times), the user is told, and the GridFS source is kept until the job really finishes. |
+| Graceful shutdown | On SIGTERM / redeploy a running job is re-queued (`♻️ Worker restarting`) and picked up by the next node. |
+| Cancel anywhere | `/cancel`, the inline 🛑 button and the Mini App cancel both RAM jobs and persisted queue documents — a running worker notices within one progress tick. |
+| Per-user cap | `MAX_JOBS_PER_USER` counts RAM *and* persisted queued/running jobs. |
+| Queue hygiene | Finished queue documents are pruned after `QUEUE_DONE_KEEP_H` (24 h); history lives in `jobs`. |
+
+All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `BOT_TOKEN`. Add more Render worker services with unique `WORKER_NODE_ID` values; the admin Mini App shows nodes (with an `embedded` badge, jobs done/failed and heartbeat age) whose heartbeat was received within the last 90 seconds. `/health` reports `role: master+worker`, the embedded worker status and online/busy worker counts.
 
 ## 🚀 Deploy on Render (free)
 
 1. **Fork / push** this repo to GitHub.
-2. Render Dashboard → **New → Blueprint** → select the repo. `render.yaml` creates one master and one worker service automatically. Add additional worker services from the same blueprint when needed.
+2. Render Dashboard → **New → Blueprint** → select the repo. `render.yaml` creates the master service (which already includes an embedded worker) and one optional extra worker service. Delete the extra worker to stay within a single free instance, or add more for parallel capacity.
 3. Fill the secret environment variables:
 
    | Variable        | Where to get it                                             |
@@ -101,8 +119,8 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 
 | Variable             | Default | Description                                                   |
 |----------------------|---------|---------------------------------------------------------------|
-| `API_ID` / `API_HASH` / `BOT_TOKEN` | — | **Required** Telegram credentials                    |
-| `OWNER_ID`           | `0`     | Permanent owner (approves requests, manages admins)            |
+| `API_ID` / `API_HASH` / `BOT_TOKEN` | **required** | Telegram credentials (my.telegram.org · @BotFather)   |
+| `OWNER_ID`           | **required** | Permanent owner (approves requests, manages admins). Send `/id` to the bot |
 | `ADMIN_USERS`        | —       | Comma-separated IDs that are admins on every start (can approve users) |
 | `AUTHORIZED_USERS`   | —       | Comma-separated IDs with lifetime access on every start        |
 | `PUBLIC_MODE`        | `0`     | `1` → everyone is approved automatically                       |
@@ -128,6 +146,14 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 | `KEEP_ALIVE`         | `1`     | Self-ping to stay awake on Render free tier                   |
 | `KEEP_ALIVE_INTERVAL`| `600`   | Ping interval in seconds                                      |
 | `PORT`               | `10000` | Set by Render automatically                                   |
+| `EMBEDDED_WORKER`    | `1`     | Master also translates in-process. `0` → polling-only master  |
+| `SERVICE_ROLE`       | `master`| `master` or `worker` (informational; `worker.py` is always a worker) |
+| `WORKER_NODE_ID`     | auto    | Stable node name shown in the Mini App (standalone workers)   |
+| `WORKER_HEARTBEAT_INTERVAL` | `30` | Seconds between `workers_status` heartbeats               |
+| `WORKER_POLL_INTERVAL` | `3`   | Seconds between queue polls when idle                         |
+| `WORKER_STALE_AFTER` | `150`   | Re-queue a running job whose heartbeat is older than this     |
+| `JOB_MAX_REQUEUES`   | `2`     | Re-queue attempts before a job is failed as `WorkerLost`      |
+| `QUEUE_DONE_KEEP_H`  | `24`    | Hours finished queue documents stay visible in the Mini App   |
 
 ## 💻 Run locally
 
@@ -136,9 +162,11 @@ git clone https://github.com/Nitesh99390/India.git && cd India
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, OWNER_ID
-python master.py          # Telegram polling + Mini App at http://localhost:10000/health
-# In another service/process, with the same MongoDB and Telegram credentials:
-SERVICE_ROLE=worker WORKER_NODE_ID=worker-1 python worker.py
+python master.py          # Telegram polling + embedded worker + Mini App at http://localhost:10000/health
+# Optional — extra capacity, with the same MongoDB and Telegram credentials:
+SERVICE_ROLE=worker WORKER_NODE_ID=worker-1 PORT=10001 python worker.py
+# Polling-only master (no in-process translation):
+EMBEDDED_WORKER=0 python master.py
 ```
 
 Test the Mini App UI without Telegram: set `MINIAPP_DEV_USER=<your id>` and open
