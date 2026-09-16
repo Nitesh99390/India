@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║        📚 NovelTranslator PRO  —  Telegram Document Translation Bot       ║
-║      v6.0  ·  Master + Workers · GridFS + Mini App · Render              ║
+║      v6.1  ·  Master + embedded/extra Workers · GridFS · Mini App        ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  • Approval-based access (no password) → users request, owner/admins    ║
 ║    approve for 1 week / month / year / lifetime / custom; auto-expiry,  ║
@@ -92,152 +92,37 @@ except ImportError:  # pragma: no cover
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔑 CONFIGURATION — everything comes from environment variables
+# 🔑 CONFIGURATION — single source of truth lives in config.py
+#     (built-in credentials + env overrides; nothing is parsed here any more)
 # ═══════════════════════════════════════════════════════════════════════════
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
+from config import (  # noqa: E402
+    ADMIN_USERS, AUDIT_LIMIT, AUTHORIZED_USERS, API_HASH, API_ID, BACKUP_GROUP_ID, BASE_DIR,
+    BOOT_TS, BOT_NAME, BOT_TOKEN, CHUNK_SIZE, CONCURRENCY_LIMIT, DB_BUDGET_MB, DB_JOB_TTL_DAYS,
+    DB_MAX_JOB_DOCS, DEFAULT_APPROVAL, DEFAULT_FORMAT, DEFAULT_LANG, DEFAULT_SPLIT_KB, EDIT_INTERVAL,
+    EMBEDDED_WORKER, EXPANSION, EXPIRY_REMINDER_DAYS, HISTORY_LIMIT, INBOX_DIR, INIT_DATA_MAX_AGE,
+    KEEP_ALIVE, KEEP_ALIVE_INTERVAL, LANGUAGES, LEGACY_USERS, MAX_INPUT_MB, MAX_JOBS_PER_USER,
+    MAX_RETRIES, MAX_SPLIT_KB, MINIAPP_DEV_USER, MINI_APP_DIR, MINI_APP_URL, MIN_SPLIT_KB, MONGO_DB,
+    MONGO_URI, OUTPUT_FORMATS, OWNER_ID, PENDING_TTL, PORT, PUBLIC_MODE, PUBLIC_URL,
+    QUEUE_DONE_KEEP_H, REJECT_COOLDOWN_H, RENDER_EXTERNAL_URL, REQUEST_TIMEOUT, SPLIT_PRESETS,
+    STORAGE_DIR, VERSION, WORKER_NODE_ID, WORKER_STALE_AFTER, env as _env,
+    validate_config as _validate_config,
+)
+import config as _cfg  # noqa: E402
 
-def _env_int(name: str, default: int) -> int:
-    raw = _env(name)
-    if not raw:
-        return default
-    try:
-        return int(float(raw))
-    except ValueError:
-        print(f"[config] {name}={raw!r} is not a number → using {default}", file=sys.stderr)
-        return default
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = _env(name).lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on", "y")
-
-def _env_int_list(name: str) -> List[int]:
-    out: List[int] = []
-    for tok in re.split(r"[,\s;]+", _env(name)):
-        tok = tok.strip()
-        if tok.lstrip("-").isdigit():
-            out.append(int(tok))
-    return out
-
-API_ID = _env_int("API_ID", 0)
-API_HASH = _env("API_HASH")
-BOT_TOKEN = _env("BOT_TOKEN")
-OWNER_ID = _env_int("OWNER_ID", 0)
-AUTHORIZED_USERS = _env_int_list("AUTHORIZED_USERS")       # lifetime access on every boot
-ADMIN_USERS = _env_int_list("ADMIN_USERS")                 # pre-configured admins (can approve users)
-PUBLIC_MODE = _env_bool("PUBLIC_MODE", False)              # True → everyone is approved automatically
-BACKUP_GROUP_ID = _env_int("BACKUP_GROUP_ID", 0)           # 0 → backups disabled
-# Approval system
-DEFAULT_APPROVAL = _env("DEFAULT_APPROVAL", "1m")          # used by /adduser without a duration (1m · 1y · forever · 45d …)
-EXPIRY_REMINDER_DAYS = max(0, min(_env_int("EXPIRY_REMINDER_DAYS", 3), 30))
-REJECT_COOLDOWN_H = max(0, _env_int("REJECT_COOLDOWN_H", 24))  # hours before a rejected user may re-request
-LEGACY_USERS = _env("LEGACY_USERS", "keep").lower()        # v4 users unlocked with the old code: keep (lifetime) | reapprove
-AUDIT_LIMIT = 300                                          # audit entries kept in RAM / DB
-
-BOT_NAME = _env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "6.0-master-worker"
-CONCURRENCY_LIMIT = max(1, min(_env_int("CONCURRENCY", 8), 20))
-CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3500), 4800))
-MAX_RETRIES = 5
-MAX_INPUT_MB = max(1, _env_int("MAX_INPUT_MB", 50))
-MAX_JOBS_PER_USER = max(1, _env_int("MAX_JOBS_PER_USER", 2))
-PENDING_TTL = 30 * 60
-EDIT_INTERVAL = 4.0
-REQUEST_TIMEOUT = 40
-DEFAULT_LANG = _env("DEFAULT_LANG", "hi")
-DEFAULT_FORMAT = _env("DEFAULT_FORMAT", "txt")
-DEFAULT_SPLIT_KB = _env_int("DEFAULT_SPLIT_KB", 500)
-MIN_SPLIT_KB, MAX_SPLIT_KB = 50, 15 * 1024
-
-# Render specific
-PORT = _env_int("PORT", 10000)
-RENDER_EXTERNAL_URL = _env("RENDER_EXTERNAL_URL").rstrip("/")
-KEEP_ALIVE = _env_bool("KEEP_ALIVE", True)
-KEEP_ALIVE_INTERVAL = max(60, _env_int("KEEP_ALIVE_INTERVAL", 600))
-
-# MongoDB — Atlas free tier (M0, 512 MB). Env var wins; the baked-in string is
-# the project's own cluster so a fresh Render deploy is persistent out of the box.
-# ⚠️  Only *metadata* is stored (users · prefs · counters · tiny job history).
-#     Uploaded / translated files are NEVER written to the database.
-DEFAULT_MONGO_URI = ("mongodb+srv://bhuimharniteshbhuimhar_db_user:nitesh9939"
-                     "@nitesh99390.qbwrf1c.mongodb.net/?appName=Nitesh99390&retryWrites=true&w=majority")
-MONGO_URI = _env("MONGO_URI") or _env("MONGODB_URI") or _env("DATABASE_URL") or DEFAULT_MONGO_URI
-if MONGO_URI.lower() in ("0", "off", "none", "memory", "disabled"):   # explicit opt-out → RAM only
-    MONGO_URI = ""
-MONGO_DB = _env("MONGO_DB", "noveltranslator")
-HISTORY_LIMIT = max(5, min(_env_int("HISTORY_LIMIT", 30), 100))
-# Free-tier storage budget. Atlas M0 = 512 MB total; we keep a wide safety margin.
-DB_BUDGET_MB = max(50, min(_env_int("DB_BUDGET_MB", 400), 512))
-DB_MAX_JOB_DOCS = max(200, _env_int("DB_MAX_JOB_DOCS", 3000))      # global cap for the `jobs` collection
-DB_JOB_TTL_DAYS = max(7, min(_env_int("DB_JOB_TTL_DAYS", 60), 365))
-
-# Telegram Mini App — served by this very process at /app (needs a public HTTPS URL)
-PUBLIC_URL = (_env("PUBLIC_URL") or RENDER_EXTERNAL_URL).rstrip("/")
-MINI_APP_URL = _env("MINI_APP_URL") or (f"{PUBLIC_URL}/app" if PUBLIC_URL else "")
-MINI_APP_DIR = _env("MINI_APP_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp")
-MINIAPP_DEV_USER = _env_int("MINIAPP_DEV_USER", 0)   # local testing only: fake signed-in user id
-INIT_DATA_MAX_AGE = 24 * 3600
-BOOT_TS = int(time.time())
-
-# Temp workspace — ephemeral by design (Render disks are wiped on every deploy)
-BASE_DIR = _env("WORK_DIR") or os.path.join(tempfile.gettempdir(), "noveltranslator")
-STORAGE_DIR = os.path.join(BASE_DIR, "out")
-INBOX_DIR = os.path.join(BASE_DIR, "inbox")
-for _d in (BASE_DIR, STORAGE_DIR, INBOX_DIR):
-    os.makedirs(_d, exist_ok=True)
-
+# PDF input only when pypdf is importable (config lists it unconditionally)
 INPUT_EXTS = {".epub", ".txt", ".docx"} | ({".pdf"} if HAS_PDF else set())
-OUTPUT_FORMATS = {"txt": "📄 TXT", "docx": "📝 DOCX", "epub": "📚 EPUB"}
-SPLIT_PRESETS = [(0, "🚫 No split"), (100, "100 KB"), (300, "300 KB"), (500, "500 KB"),
-                 (1024, "1 MB"), (2048, "2 MB"), (5120, "5 MB")]
-
-LANGUAGES: Dict[str, Tuple[str, str]] = {
-    "hi": ("Hindi", "🇮🇳"), "en": ("English", "🇬🇧"), "bn": ("Bengali", "🇧🇩"),
-    "ta": ("Tamil", "🇮🇳"), "te": ("Telugu", "🇮🇳"), "mr": ("Marathi", "🇮🇳"),
-    "gu": ("Gujarati", "🇮🇳"), "kn": ("Kannada", "🇮🇳"), "ml": ("Malayalam", "🇮🇳"),
-    "pa": ("Punjabi", "🇮🇳"), "ur": ("Urdu", "🇵🇰"), "ne": ("Nepali", "🇳🇵"),
-    "es": ("Spanish", "🇪🇸"), "fr": ("French", "🇫🇷"), "de": ("German", "🇩🇪"),
-    "pt": ("Portuguese", "🇧🇷"), "ru": ("Russian", "🇷🇺"), "ar": ("Arabic", "🇸🇦"),
-    "id": ("Indonesian", "🇮🇩"), "tr": ("Turkish", "🇹🇷"), "vi": ("Vietnamese", "🇻🇳"),
-    "th": ("Thai", "🇹🇭"), "zh-CN": ("Chinese", "🇨🇳"), "ja": ("Japanese", "🇯🇵"),
-    "ko": ("Korean", "🇰🇷"),
-}
-# Rough UTF-8 growth of translated text vs. Latin source (used only for estimates)
-EXPANSION = {**{k: 2.6 for k in ("hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa", "ne")},
-             "ur": 1.9, "ar": 1.8, "ru": 1.8, "th": 2.6, "zh-CN": 0.9, "ja": 1.2, "ko": 1.2}
-
-if DEFAULT_LANG not in LANGUAGES:
-    DEFAULT_LANG = "hi"
-if DEFAULT_FORMAT not in OUTPUT_FORMATS:
-    DEFAULT_FORMAT = "txt"
-if DEFAULT_SPLIT_KB and not (MIN_SPLIT_KB <= DEFAULT_SPLIT_KB <= MAX_SPLIT_KB):
-    DEFAULT_SPLIT_KB = 500
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔧 LOGGING  (stdout only — Render captures it; no log files on disk)
 # ═══════════════════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
-logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 def validate_config() -> None:
-    problems = []
-    if not API_ID: problems.append("API_ID")
-    if not API_HASH: problems.append("API_HASH")
-    if not BOT_TOKEN or ":" not in BOT_TOKEN: problems.append("BOT_TOKEN")
-    if not OWNER_ID and not PUBLIC_MODE:
-        problems.append("OWNER_ID (your numeric Telegram ID — the owner approves access requests)")
-    if problems:
-        log.critical("Missing / invalid environment variables: %s", ", ".join(problems))
-        log.critical("Set them in the Render dashboard → Environment, then redeploy.")
+    try:
+        _validate_config(require_telegram=True, role="master")
+    except RuntimeError as e:
+        log.critical("%s", e)
+        log.critical("Set the missing values in the Render dashboard → Environment (or config.py), then redeploy.")
         sys.exit(1)
     if _env("SECURITY_CODE"):
         log.warning("SECURITY_CODE is no longer used — access is approval based now (v5). You can remove the variable.")
@@ -1004,7 +889,8 @@ class Store:
 
 MemoryStore = Store          # backwards-compatible alias
 store = Store()
-QUEUE_REPO = None
+QUEUE_REPO = None            # database.MongoDatabase view over store.db (shared jobs_queue + GridFS)
+EMBEDDED = None              # worker.TranslationWorker running inside the master (EMBEDDED_WORKER=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1770,6 +1656,16 @@ def user_job_count(uid: int) -> int:
         n += 1
     return n
 
+async def user_job_count_all(uid: int) -> int:
+    """RAM queue + persisted jobs_queue (queued/running) for the per-user cap."""
+    n = user_job_count(uid)
+    if QUEUE_REPO:
+        try:
+            n += await QUEUE_REPO.queued_count(uid)
+        except Exception as e:
+            log.debug("queued_count: %s", e)
+    return n
+
 def summary_block(job: Job) -> str:
     return (
         f"📘 File: {b(job.novel_name)}\n"
@@ -1799,13 +1695,46 @@ async def enqueue(job: Job, message: Message):
             "size": job.file_size, "ext": job.ext, "lang": job.lang, "fmt": job.out_format,
             "split_kb": job.split_kb,
         })
+        pos = await QUEUE_REPO.queue_position(job.job_id) or 1
+        store.audit("enqueue", job.user_id, job.user_id, job=job.job_id, name=job.novel_name[:60])
     else:
         # RAM-only mode is kept for the offline Mini App harness. Production
         # master/worker deployments require MongoDB so jobs survive restarts.
         QUEUE.append(job)
-    await LiveMessage(message).update(queued_text(job, queue_position(job)), cancel_kb(job), force=True)
+        pos = queue_position(job)
+    await LiveMessage(message).update(queued_text(job, pos), cancel_kb(job), force=True)
     if QUEUE_WAKE:
         QUEUE_WAKE.set()
+
+async def cancel_persisted(job_id: str, uid: int) -> bool:
+    """Cancel a queued/running job in the shared MongoDB queue (owner may cancel anyone's)."""
+    if not QUEUE_REPO or not job_id:
+        return False
+    try:
+        ok = await QUEUE_REPO.cancel_job(job_id, uid, owner=store.is_owner(uid))
+    except Exception as e:
+        log.debug("cancel_job: %s", e)
+        return False
+    if ok:
+        store.audit("cancel", uid, uid, job=job_id)
+        doc = await QUEUE_REPO.get_job(job_id)
+        # a *queued* job is never picked up again → drop its GridFS source right away;
+        # running jobs are cleaned by the worker that notices the cancellation.
+        if doc and not doc.get("worker_id"):
+            await QUEUE_REPO.delete_file(str(doc.get("file_id", "")))
+    return ok
+
+async def cancel_all_persisted(uid: int) -> int:
+    if not QUEUE_REPO:
+        return 0
+    n = 0
+    try:
+        for doc in await QUEUE_REPO.list_user_jobs(uid, owner=False, limit=50):
+            if doc.get("status") in ("queued", "running"):
+                n += int(await cancel_persisted(str(doc.get("_id")), uid))
+    except Exception as e:
+        log.debug("cancel_all_persisted: %s", e)
+    return n
 
 async def notify_positions():
     for i, j in enumerate(list(QUEUE), 1):
@@ -1870,6 +1799,12 @@ async def janitor():
             await access_sweep()
         except Exception as e:
             log.warning("access sweep failed: %s", e)
+        if QUEUE_REPO and not EMBEDDED:      # the embedded worker already runs this loop
+            try:
+                await QUEUE_REPO.requeue_stale()
+                await QUEUE_REPO.prune_finished()
+            except Exception as e:
+                log.debug("queue maintenance: %s", e)
         for jid, job in list(PENDING.items()):
             if now - job.created > PENDING_TTL:
                 job.cleanup()
@@ -2626,7 +2561,7 @@ async def cmd_queue(_, m: Message):
 @app.on_message(filters.command("cancel") & PRIVATE & authorized)
 async def cmd_cancel(_, m: Message):
     uid = m.from_user.id
-    n = 0
+    n = await cancel_all_persisted(uid)
     if ACTIVE and ACTIVE.user_id == uid:
         ACTIVE.cancel.set(); n += 1
     for j in [j for j in QUEUE if j.user_id == uid]:
@@ -3058,7 +2993,7 @@ async def handle_document(_, m: Message):
         return await m.reply("🔄 Server is restarting, please try again in a minute.")
 
     uid = m.from_user.id
-    if user_job_count(uid) >= MAX_JOBS_PER_USER:
+    if await user_job_count_all(uid) >= MAX_JOBS_PER_USER:
         return await m.reply(f"⏳ You already have {b(MAX_JOBS_PER_USER)} job(s) running/queued.\n"
                              "Please wait for them to finish or use /cancel.")
 
@@ -3286,6 +3221,14 @@ async def callbacks(_, q: CallbackQuery):
                 await _edit(q, header("Cancelled", "🛑") + summary_block(j), back_home_kb())
                 await notify_positions()
                 return await _answer(q, "Removed from queue")
+        if await cancel_persisted(arg1, uid):
+            doc = await QUEUE_REPO.get_job(arg1) if QUEUE_REPO else None
+            if doc and doc.get("worker_id"):
+                return await _answer(q, "🛑 Stopping… the worker will confirm shortly.")
+            await _edit(q, header("Cancelled", "🛑") +
+                        (f"📘 File: {b(doc.get('name', 'Document'))}\n" if doc else "") +
+                        "Removed from the queue.", back_home_kb())
+            return await _answer(q, "Removed from queue")
         return await _answer(q, "Job already finished.")
 
     if kind in ("jl", "jf", "js", "jc", "jx", "jq", "jgo", "jb"):
@@ -3796,7 +3739,9 @@ async def api_job_cancel(request: web.Request) -> web.Response:
     owner = store.is_owner(uid)
     n = 0
     if QUEUE_REPO and target:
-        n += int(await QUEUE_REPO.cancel_job(target, uid, owner=owner))
+        n += int(await cancel_persisted(target, uid))
+    elif QUEUE_REPO:
+        n += await cancel_all_persisted(uid)
     if ACTIVE and (not target or ACTIVE.job_id == target) and (ACTIVE.user_id == uid or owner):
         ACTIVE.cancel.set(); n += 1
     for j in [j for j in QUEUE if (not target or j.job_id == target) and (j.user_id == uid or owner)]:
@@ -3829,14 +3774,25 @@ async def api_admin_overview(request: web.Request) -> web.Response:
     users = [_user_public(uid, u) for uid, u in store.users.items()]
     users.sort(key=lambda x: (_STATUS_ORDER.get(x["access"]["status"], 9), -x["last_seen"]))
     workers = await QUEUE_REPO.workers() if QUEUE_REPO else []
+    queue_len = len(QUEUE)
+    active_doc = None
+    if QUEUE_REPO:
+        try:
+            rows = await QUEUE_REPO.list_user_jobs(tg["id"], owner=True, limit=100)
+            queue_len += sum(1 for r in rows if r.get("status") == "queued")
+            active_doc = next((r for r in rows if r.get("status") == "running"), None)
+        except Exception as e:
+            log.debug("overview queue: %s", e)
     return _json({"ok": True, "stats": store.stats, "uptime": int(time.time() - store.booted),
+                  "version": VERSION, "embedded_worker": EMBEDDED.status() if EMBEDDED else None,
                   "users": users, "counts": store.count_by_status(),
                   "pending": [_user_public(uid, u) for uid, u in store.pending_users()],
                   "admins": [a for a in store.admins() if not store.is_owner(a)], "owner_id": store.owner_id,
                   "chats": len(store.chats), "recent": store.recent_history(30) if owner else [],
                   "audit": store.recent_audit(40) if owner else [],
-                  "active": _job_public(ACTIVE, tg["id"]) if ACTIVE else None,
-                  "queue_len": len(QUEUE), "pending_len": len(PENDING),
+                  "active": (_job_public(ACTIVE, tg["id"]) if ACTIVE
+                             else _job_public_doc(active_doc, tg["id"]) if active_doc else None),
+                  "queue_len": queue_len, "pending_len": len(PENDING),
                   "db": store.connected, "db_budget": store.budget_info() if store.connected else None,
                   "public_mode": PUBLIC_MODE, "backup_group": BACKUP_GROUP_ID,
                   "env_admins": ADMIN_USERS, "env_users": AUTHORIZED_USERS,
@@ -3990,10 +3946,19 @@ async def miniapp_file(request: web.Request) -> web.Response:
 # 🌍 HEALTH SERVER  (Render web services must bind $PORT)
 # ═══════════════════════════════════════════════════════════════════════════
 async def health(_request: web.Request) -> web.Response:
+    workers = []
+    if QUEUE_REPO:
+        try:
+            workers = await QUEUE_REPO.workers()
+        except Exception:
+            workers = []
     return web.json_response({
         "status": "ok" if not SHUTTING_DOWN else "shutting_down",
-        "role": "master",
+        "role": "master+worker" if EMBEDDED else "master",
         "polling": True,
+        "embedded_worker": EMBEDDED.status() if EMBEDDED else None,
+        "workers": len(workers),
+        "workers_busy": sum(1 for w in workers if w.get("status") == "running"),
         "bot": BOT_USERNAME,
         "version": VERSION,
         "uptime_sec": int(time.time() - store.booted),
@@ -4092,11 +4057,16 @@ async def shutdown_jobs():
         QUEUE_WAKE.set()
 
 async def main():
-    global QUEUE_WAKE, BOT_USERNAME, QUEUE_REPO
+    global QUEUE_WAKE, BOT_USERNAME, QUEUE_REPO, EMBEDDED
     QUEUE_WAKE = asyncio.Event()
     runner = await start_health_server()          # bind the port FIRST → Render sees us healthy
     await store.connect()                         # MongoDB → users, GridFS and shared jobs_queue
     QUEUE_REPO = job_repo_from_store(store)
+    if QUEUE_REPO:
+        try:
+            await QUEUE_REPO.ensure_indexes()
+        except Exception as e:
+            log.debug("queue indexes: %s", e)
 
     for attempt in range(1, 6):
         try:
@@ -4130,15 +4100,28 @@ async def main():
             log.debug("set_chat_menu_button: %s", e)
     tasks = [asyncio.create_task(janitor(), name="janitor"),
              asyncio.create_task(keep_alive(), name="keep_alive")]
-    log.info("%s online as @%s | owner=%s | users=%d | public=%s | pdf=%s | db=%s | app=%s | port=%d",
-             BOT_NAME, me.username, store.owner_id or "none", len(store.users), PUBLIC_MODE, HAS_PDF,
-             "mongodb" if store.connected else "memory", MINI_APP_URL or "-", PORT)
+    # Embedded worker: the master translates too, so one free Render service is enough.
+    if EMBEDDED_WORKER and QUEUE_REPO:
+        from worker import TranslationWorker
+        EMBEDDED = TranslationWorker(client=app, db=QUEUE_REPO, embedded=True)
+        tasks.append(asyncio.create_task(EMBEDDED.serve(), name="embedded_worker"))
+        log.info("Embedded worker %s started (set EMBEDDED_WORKER=0 for a polling-only master)", EMBEDDED.node_id)
+    elif EMBEDDED_WORKER:
+        log.warning("EMBEDDED_WORKER=1 but MongoDB is unavailable → no translation worker is running!")
+    else:
+        log.info("Embedded worker disabled — deploy at least one worker.py service")
+    workers_now = await QUEUE_REPO.workers() if QUEUE_REPO else []
+    log.info("%s v%s online as @%s | owner=%s | users=%d | public=%s | pdf=%s | db=%s | app=%s | port=%d | workers=%d",
+             BOT_NAME, VERSION, me.username, store.owner_id or "none", len(store.users), PUBLIC_MODE, HAS_PDF,
+             "mongodb" if store.connected else "memory", MINI_APP_URL or "-", PORT, len(workers_now))
     if store.owner_id:
         await safe_send(store.owner_id, header("Bot Online", "🟢") +
-                        f"@{me.username} is running.\n"
+                        f"@{me.username} is running · v{VERSION}\n"
                         f"👥 Users: {b(len(store.users))}\n"
                         f"📄 PDF support: {b('yes' if HAS_PDF else 'no')}\n"
                         f"🗄 Storage: {b('MongoDB · ' + MONGO_DB if store.connected else 'in-memory (no database)')}\n"
+                        f"⚙️ Worker: {b('embedded · ' + EMBEDDED.node_id if EMBEDDED else 'external only')}"
+                        + (f" · {len(workers_now)} online" if workers_now else "") + "\n"
                         f"📱 Mini App: {b('enabled' if MINI_APP_URL.startswith('https://') else 'not configured')}")
     else:
         log.warning("No OWNER_ID configured — nobody can approve access requests! Set OWNER_ID in the environment.")
@@ -4147,6 +4130,8 @@ async def main():
 
     log.info("Shutting down…")
     await shutdown_jobs()
+    if EMBEDDED:
+        EMBEDDED.stop()                           # loops exit; a running job is handed back to the queue
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)

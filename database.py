@@ -16,7 +16,10 @@ except ImportError:  # pragma: no cover
     AsyncIOMotorClient = None
     AsyncIOMotorGridFSBucket = None
 
-from config import DB_JOB_TTL_DAYS, MONGO_DB, MONGO_URI, WORKER_HEARTBEAT_INTERVAL
+from config import (DB_JOB_TTL_DAYS, JOB_MAX_REQUEUES, MONGO_DB, MONGO_URI, QUEUE_DONE_KEEP_H,
+                    WORKER_HEARTBEAT_INTERVAL, WORKER_STALE_AFTER)
+
+FINISHED = ("done", "failed", "cancelled")
 
 
 class MongoDatabase:
@@ -52,6 +55,7 @@ class MongoDatabase:
             return
         await self.db.jobs_queue.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
         await self.db.jobs_queue.create_index("user_id")
+        await self.db.jobs_queue.create_index("updated_at")
         await self.db.workers_status.create_index("last_seen")
         await self.db.jobs.create_index([("uid", ASCENDING), ("ts", DESCENDING)])
         await self.db.jobs.create_index("ts", expireAfterSeconds=DB_JOB_TTL_DAYS * 86400)
@@ -79,7 +83,8 @@ class MongoDatabase:
     async def enqueue_job(self, job: Dict[str, Any]) -> bool:
         if self.db is None:
             return False
-        job = {**job, "status": "queued", "created_at": time.time(), "updated_at": time.time()}
+        job = {**job, "_id": job["job_id"], "status": "queued", "requeues": 0,
+               "created_at": time.time(), "updated_at": time.time()}
         await self.db.jobs_queue.replace_one({"_id": job["job_id"]}, job, upsert=True)
         return True
 
@@ -88,7 +93,8 @@ class MongoDatabase:
             return None
         return await self.db.jobs_queue.find_one_and_update(
             {"status": "queued"},
-            {"$set": {"status": "running", "worker_id": node_id, "started_at": time.time(), "updated_at": time.time()}},
+            {"$set": {"status": "running", "worker_id": node_id, "started_at": time.time(),
+                      "heartbeat": time.time(), "updated_at": time.time()}},
             sort=[("created_at", ASCENDING)], return_document=ReturnDocument.AFTER)
 
     async def update_job(self, job_id: str, **fields: Any) -> None:
@@ -96,13 +102,82 @@ class MongoDatabase:
             fields["updated_at"] = time.time()
             await self.db.jobs_queue.update_one({"_id": job_id}, {"$set": fields})
 
+    async def touch_job(self, job_id: str, progress: Optional[Dict[str, Any]] = None) -> bool:
+        """Refresh the job heartbeat (+ optional progress). Returns False when the
+        job was cancelled meanwhile so the worker can stop early."""
+        if self.db is None:
+            return True
+        fields: Dict[str, Any] = {"heartbeat": time.time(), "updated_at": time.time()}
+        if progress is not None:
+            fields["progress"] = progress
+        doc = await self.db.jobs_queue.find_one_and_update(
+            {"_id": job_id}, {"$set": fields}, projection={"status": 1}, return_document=ReturnDocument.AFTER)
+        return bool(doc) and doc.get("status") == "running"
+
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        if self.db is None:
+            return None
+        return await self.db.jobs_queue.find_one({"_id": job_id})
+
+    async def queue_position(self, job_id: str) -> int:
+        """1-based position of a queued job (0 = not queued)."""
+        if self.db is None:
+            return 0
+        doc = await self.db.jobs_queue.find_one({"_id": job_id}, {"created_at": 1, "status": 1})
+        if not doc or doc.get("status") != "queued":
+            return 0
+        ahead = await self.db.jobs_queue.count_documents(
+            {"status": "queued", "created_at": {"$lt": doc.get("created_at", 0)}})
+        return ahead + 1
+
+    async def queued_count(self, user_id: Optional[int] = None) -> int:
+        if self.db is None:
+            return 0
+        query: Dict[str, Any] = {"status": {"$in": ["queued", "running"]}}
+        if user_id is not None:
+            query["user_id"] = user_id
+        return await self.db.jobs_queue.count_documents(query)
+
+    async def requeue_stale(self) -> list[dict]:
+        """Hand jobs back to the queue when their worker stopped sending heartbeats
+        (crash / redeploy of a free instance). Jobs over JOB_MAX_REQUEUES fail."""
+        if self.db is None:
+            return []
+        cutoff = time.time() - WORKER_STALE_AFTER
+        stale = await self.db.jobs_queue.find(
+            {"status": "running", "heartbeat": {"$lt": cutoff}}).to_list(100)
+        touched = []
+        for job in stale:
+            requeues = int(job.get("requeues", 0) or 0)
+            if requeues >= JOB_MAX_REQUEUES:
+                update = {"$set": {"status": "failed", "error": "WorkerLost", "finished_at": time.time(),
+                                   "updated_at": time.time()}}
+            else:
+                update = {"$set": {"status": "queued", "worker_id": None, "progress": {"phase": "requeued", "ratio": 0},
+                                   "updated_at": time.time()}, "$inc": {"requeues": 1}}
+            result = await self.db.jobs_queue.update_one(
+                {"_id": job["_id"], "status": "running", "heartbeat": {"$lt": cutoff}}, update)
+            if result.modified_count:
+                job["requeued"] = requeues < JOB_MAX_REQUEUES
+                touched.append(job)
+        return touched
+
+    async def prune_finished(self) -> int:
+        """Drop finished queue documents older than QUEUE_DONE_KEEP_H (history lives in `jobs`)."""
+        if self.db is None:
+            return 0
+        cutoff = time.time() - QUEUE_DONE_KEEP_H * 3600
+        result = await self.db.jobs_queue.delete_many({"status": {"$in": list(FINISHED)}, "updated_at": {"$lt": cutoff}})
+        return int(result.deleted_count)
+
     async def cancel_job(self, job_id: str, user_id: int, owner: bool = False) -> bool:
         if self.db is None:
             return False
         query = {"_id": job_id, "status": {"$in": ["queued", "running"]}}
         if not owner:
             query["user_id"] = user_id
-        result = await self.db.jobs_queue.update_one(query, {"$set": {"status": "cancelled", "updated_at": time.time()}})
+        result = await self.db.jobs_queue.update_one(
+            query, {"$set": {"status": "cancelled", "finished_at": time.time(), "updated_at": time.time()}})
         return result.modified_count == 1
 
     async def list_user_jobs(self, user_id: int, owner: bool = False, limit: int = 30) -> list[dict]:
@@ -112,18 +187,28 @@ class MongoDatabase:
         rows = await self.db.jobs_queue.find(query).sort("created_at", DESCENDING).to_list(limit)
         return rows
 
-    async def heartbeat(self, node_id: str, status: str = "idle", current_job: Optional[str] = None) -> None:
+    async def heartbeat(self, node_id: str, status: str = "idle", current_job: Optional[str] = None,
+                        **extra: Any) -> None:
         if self.db is not None:
             await self.db.workers_status.update_one(
                 {"_id": node_id},
                 {"$set": {"node_id": node_id, "status": status, "current_job": current_job,
-                          "last_seen": time.time(), "heartbeat_interval": WORKER_HEARTBEAT_INTERVAL}}, upsert=True)
+                          "last_seen": time.time(), "heartbeat_interval": WORKER_HEARTBEAT_INTERVAL, **extra}},
+                upsert=True)
 
     async def workers(self) -> list[dict]:
         if self.db is None:
             return []
         cutoff = time.time() - max(WORKER_HEARTBEAT_INTERVAL * 3, 90)
-        return await self.db.workers_status.find({"last_seen": {"$gte": cutoff}}, {"_id": 0}).sort("last_seen", DESCENDING).to_list(100)
+        rows = await self.db.workers_status.find({"last_seen": {"$gte": cutoff}}, {"_id": 0}).sort("last_seen", DESCENDING).to_list(100)
+        now = time.time()
+        for row in rows:
+            row["age"] = int(now - float(row.get("last_seen", now)))
+        return rows
+
+    async def remove_worker(self, node_id: str) -> None:
+        if self.db is not None:
+            await self.db.workers_status.delete_one({"_id": node_id})
 
     async def record_history(self, job: Dict[str, Any]) -> None:
         if self.db is not None:
