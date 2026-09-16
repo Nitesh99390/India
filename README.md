@@ -1,6 +1,6 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v6.3 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
+**v6.4 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
 
 The master process (Pyrogram + aiohttp) accepts Telegram updates and — by default —
 also runs a translation worker in-process, so **one free Render service is a complete
@@ -82,7 +82,8 @@ deliver the result as TXT, DOCX or EPUB — split into parts of any size you lik
 | Graceful shutdown | On SIGTERM / redeploy a running job is re-queued (`♻️ Worker restarting`) and picked up by the next node. |
 | Cancel anywhere | `/cancel`, the inline 🛑 button and the Mini App cancel both RAM jobs and persisted queue documents — a running worker notices within one progress tick. |
 | Per-user cap | `MAX_JOBS_PER_USER` counts RAM *and* persisted queued/running jobs. |
-| Queue hygiene | Finished queue documents are pruned after `QUEUE_DONE_KEEP_H` (24 h); history lives in `jobs`. |
+| Queue hygiene | Finished queue documents are pruned after `QUEUE_DONE_KEEP_H` (24 h); history lives in `jobs`. Any GridFS source still attached to a pruned document is deleted with it. |
+| GridFS hygiene (v6.4) | Uploads happen *before* the options wizard, so an abandoned wizard, a master restart mid-wizard or a worker crash between delivery and cleanup used to leave the source in `documents.*` forever. Now a wizard that is discarded/expired deletes its upload immediately, and every worker's `recover_loop` (or the master janitor) runs `prune_orphan_files()` each minute: any GridFS file older than `ORPHAN_FILE_AGE_H` (2 h) that no queued/running job references is removed. `/health` reports `gridfs: {files, mb}`. |
 
 All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `BOT_TOKEN`. Add more Render worker services with unique `WORKER_NODE_ID` values; the admin Mini App shows nodes (with an `embedded` badge, jobs done/failed and heartbeat age) whose heartbeat was received within the last 90 seconds. `/health` reports `role: master+worker`, the embedded worker status and online/busy worker counts.
 
@@ -152,6 +153,7 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 | `WORKER_STALE_AFTER` | `150`   | Re-queue a running job whose heartbeat is older than this     |
 | `JOB_MAX_REQUEUES`   | `2`     | Re-queue attempts before a job is failed as `WorkerLost`      |
 | `QUEUE_DONE_KEEP_H`  | `24`    | Hours finished queue documents stay visible in the Mini App   |
+| `ORPHAN_FILE_AGE_H`  | `2`     | Delete GridFS sources older than this that no live job references (min 1 h, must exceed the 30 min wizard TTL) |
 
 ## 💻 Run locally
 

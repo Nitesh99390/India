@@ -171,6 +171,10 @@ class TranslationWorker:
                         await self._send(job["chat_id"], f"⚠️ <b>{html.escape(job.get('name', 'Document'))}</b> "
                                                          "could not be completed. Please send the file again.")
                 await self.db.prune_finished()
+                # GridFS sources left behind by abandoned wizards / crashed nodes.
+                # Cheap (one indexed query) so every worker may run it each minute.
+                if hasattr(self.db, "prune_orphan_files"):
+                    await self.db.prune_orphan_files()
             except Exception as e:
                 log.debug("recover loop: %s", e)
             try:

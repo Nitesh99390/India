@@ -38,6 +38,15 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    raw = env(name)
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        print(f"[config] {name}={raw!r} is not numeric; using {default}", file=sys.stderr)
+        return default
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     raw = env(name).lower()
     return default if not raw else raw in {"1", "true", "yes", "on", "y"}
@@ -78,7 +87,7 @@ LEGACY_USERS = env("LEGACY_USERS", "keep").lower()
 # 📋 BOT IDENTITY & VERSIONING
 # ═══════════════════════════════════════════════════════════════════════════
 BOT_NAME = env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "6.3-master-worker"
+VERSION = "6.4-master-worker"
 SERVICE_ROLE = env("SERVICE_ROLE", "master").lower()  # "master" or "worker"
 WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
 # The master also runs a translation worker in-process by default, so a single
@@ -140,6 +149,10 @@ WORKER_STALE_AFTER = max(60, env_int("WORKER_STALE_AFTER", 150))
 JOB_MAX_REQUEUES = max(0, env_int("JOB_MAX_REQUEUES", 2))
 # Finished queue documents are kept this long for the Mini App, then pruned
 QUEUE_DONE_KEEP_H = max(1, env_int("QUEUE_DONE_KEEP_H", 24))
+# GridFS sources not referenced by any queued/running job (abandoned wizard, crash
+# before cleanup) are deleted once older than this many hours. Must stay above
+# PENDING_TTL (30 min) so an open wizard never loses its upload.
+ORPHAN_FILE_AGE_H = max(1.0, env_float("ORPHAN_FILE_AGE_H", 2.0))
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 📱 MINI APP & WEB INTERFACE
