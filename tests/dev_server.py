@@ -15,7 +15,7 @@ import uuid
 
 os.environ.setdefault("API_ID", "12345")
 os.environ.setdefault("API_HASH", "dev")
-os.environ.setdefault("BOT_TOKEN", "123:dev")
+os.environ.setdefault("BOT_TOKEN", "1234567890:DEVdevdevdevdevdevdevdevdevdevdevde")  # fake, shape-valid
 os.environ.setdefault("MONGO_URI", "off")          # RAM only — no network needed
 os.environ.setdefault("PORT", "8080")
 os.environ.setdefault("MINIAPP_DEV_USER", "777")

@@ -9,7 +9,7 @@ DOCX or EPUB parts back to the user.
 - `master.py` is the only Telegram polling process and serves the Mini App/API and health endpoint.
 - `worker.py` runs without Telegram polling, claims `jobs_queue` documents atomically, processes files from GridFS, reports progress, delivers output, and sends heartbeats to `workers_status`.
 - v6.1+: the master embeds a `TranslationWorker` (same Pyrogram client, `EMBEDDED_WORKER=1` default) so a single free service is a complete deployment; standalone workers add capacity. `EMBEDDED_WORKER=0` gives a polling-only master.
-- `config.py` is the single source of truth for configuration (environment / `.env` only — Telegram credentials and `OWNER_ID` are never committed; only the MongoDB URI has a project default). `bot.py` no longer parses env vars itself.
+- `config.py` is the single source of truth for configuration. v6.5: `API_ID` / `API_HASH`, `OWNER_ID` and the MongoDB URI have built-in project defaults (env overrides), while **`BOT_TOKEN` is environment-only** (`BOT_TOKEN`, or aliases `TELEGRAM_BOT_TOKEN` / `TG_BOT_TOKEN`) and is never committed. `bot_token_problem()` returns an actionable message for a missing/malformed token and `validate_config()` raises it before any Telegram client is built; `render.yaml` declares `BOT_TOKEN` with `sync: false` for both services. `bot.py` no longer parses env vars itself.
 - Multiple workers share MongoDB and one bot token; only one master may be deployed for a bot token.
 
 ## Data model

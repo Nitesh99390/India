@@ -1,6 +1,6 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v6.4 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
+**v6.5 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
 
 The master process (Pyrogram + aiohttp) accepts Telegram updates and — by default —
 also runs a translation worker in-process, so **one free Render service is a complete
@@ -8,10 +8,12 @@ deployment**. Extra stateless `worker.py` services simply add parallel capacity.
 Workers translate whole documents (EPUB / TXT / DOCX / PDF) into 25 languages and
 deliver the result as TXT, DOCX or EPUB — split into parts of any size you like.
 
-> 🚀 **Zero-config deploy.** `config.py` is the single source of truth and ships working
-> built-in defaults for Telegram `API_ID` / `API_HASH` / `BOT_TOKEN`, `OWNER_ID` and
-> `MONGO_URI`. Both `master.py` and `worker.py` start with an **empty environment** —
-> just deploy. Set an env var (Render dashboard, Docker `-e`, or `.env`) only to override.
+> 🚀 **One-variable deploy.** `config.py` is the single source of truth and ships working
+> built-in defaults for Telegram `API_ID` / `API_HASH`, `OWNER_ID` and `MONGO_URI`.
+> The **only** thing you provide is `BOT_TOKEN` — as an **environment variable**
+> (Render dashboard → Environment, Docker `-e BOT_TOKEN=…`, or `.env`). The bot secret is
+> never committed to the repository; both `master.py` and `worker.py` refuse to start
+> with a clear message until it is set. Set any other env var only to override a default.
 
 > 🗄 **MongoDB persistence out of the box.** The bot ships with the project's own
 > MongoDB Atlas free-tier (M0, 512 MB) connection string baked in, so users, settings,
@@ -91,13 +93,16 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 
 1. **Fork / push** this repo to GitHub.
 2. Render Dashboard → **New → Blueprint** → select the repo. `render.yaml` creates the master service (which already includes an embedded worker) and one optional extra worker service. Delete the extra worker to stay within a single free instance, or add more for parallel capacity.
-3. Nothing to fill in — the credentials below are built into `config.py`. Override only if you want to:
+3. Render asks for **one** value — `BOT_TOKEN` (declared `sync: false` in `render.yaml`, so it
+   is stored only in the dashboard, never in git). Paste the raw token from @BotFather for the
+   master **and** the optional worker service (they must share the same bot). Everything else
+   is built into `config.py`; override only if you want to:
 
    | Variable        | Built-in default | Where to get your own                              |
    |-----------------|------------------|----------------------------------------------------|
+   | `BOT_TOKEN`     | ❌ **required (env var)** | @BotFather → `/newbot`                     |
    | `API_ID`        | ✅ included      | https://my.telegram.org → API development tools    |
    | `API_HASH`      | ✅ included      | same page                                          |
-   | `BOT_TOKEN`     | ✅ included      | @BotFather → `/newbot`                             |
    | `OWNER_ID`      | ✅ `6069200310`  | your numeric Telegram ID (send `/id` to the bot)   |
    | `MONGO_URI`     | ✅ project Atlas cluster | your own free [MongoDB Atlas](https://www.mongodb.com/atlas) `mongodb+srv://…` (allow `0.0.0.0/0`); `off` = RAM-only |
 
@@ -118,7 +123,8 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 
 | Variable             | Default | Description                                                   |
 |----------------------|---------|---------------------------------------------------------------|
-| `API_ID` / `API_HASH` / `BOT_TOKEN` | built-in | Telegram credentials (my.telegram.org · @BotFather) — override to use another bot |
+| `BOT_TOKEN`          | **required** | Bot token from @BotFather — environment variable only, never in the repo (aliases `TELEGRAM_BOT_TOKEN` / `TG_BOT_TOKEN` also accepted) |
+| `API_ID` / `API_HASH` | built-in | Telegram app credentials (my.telegram.org) — override to use another app |
 | `OWNER_ID`           | `6069200310` | Permanent owner (approves requests, manages admins). Send `/id` to the bot |
 | `ADMIN_USERS`        | —       | Comma-separated IDs that are admins on every start (can approve users) |
 | `AUTHORIZED_USERS`   | —       | Comma-separated IDs with lifetime access on every start        |
@@ -161,9 +167,9 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 git clone https://github.com/Nitesh99390/India.git && cd India
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # optional — everything already has a built-in default
+cp .env.example .env      # then put your @BotFather token in BOT_TOKEN= (the only required value)
 python master.py          # Telegram polling + embedded worker + Mini App at http://localhost:10000/health
-# Optional — extra capacity, with the same MongoDB and Telegram credentials:
+# Optional — extra capacity, with the same MongoDB and the same BOT_TOKEN:
 SERVICE_ROLE=worker WORKER_NODE_ID=worker-1 PORT=10001 python worker.py
 # Polling-only master (no in-process translation):
 EMBEDDED_WORKER=0 python master.py
@@ -189,7 +195,8 @@ tests/devctl.sh stopall
 
 ```bash
 docker build -t noveltranslator .
-docker run -d --env-file .env -p 10000:10000 noveltranslator
+docker run -d -e BOT_TOKEN=123456:your_bot_token -p 10000:10000 noveltranslator
+# or keep the token in .env:  docker run -d --env-file .env -p 10000:10000 noveltranslator
 ```
 
 ## 💬 Commands
@@ -227,7 +234,7 @@ every client automatically — no manual version bump needed.
 
 ## 🔒 Security
 
-- No credentials are hard-coded; the bot refuses to start if required env vars are missing.
+- The bot token is **never** stored in the repository — `BOT_TOKEN` comes exclusively from the environment (`sync: false` in `render.yaml`), and both services refuse to start with an actionable message when it is missing or malformed. Only the Telegram app id/hash, owner id and the MongoDB URI have built-in defaults.
 - Nobody can use the bot until the owner or an admin approves them; approvals carry an expiry and every decision is audited (`/audit`, Mini App audit log).
 - Mini App requests are authenticated with Telegram's `initData` HMAC (bot-token derived key, 24 h max age); the dev-user bypass is disabled whenever `RENDER_EXTERNAL_URL` is set.
 - `.env`, sessions and temp folders are git-ignored. Rotate your bot token if it was ever shared publicly.

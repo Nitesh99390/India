@@ -1,10 +1,11 @@
 """Shared configuration for NovelTranslator PRO master and workers (v6.2 Master-Worker).
 
 Everything can be overridden from environment variables (``.env`` is loaded when
-python-dotenv is installed), but **every required value ships with a working
-built-in default** — Telegram credentials, owner ID and the MongoDB cluster — so a
-fresh Render/Docker deploy of *either* service (master or worker) starts with zero
-configuration.  Set an env var only when you want to change something.
+python-dotenv is installed).  ``API_ID`` / ``API_HASH``, ``OWNER_ID`` and the MongoDB
+cluster ship with working built-in defaults, so the **only** value a fresh
+Render/Docker deploy of *either* service (master or worker) must provide is
+``BOT_TOKEN`` — the bot secret is never committed to the repository.  Set any other
+env var only when you want to change something.
 """
 
 from __future__ import annotations
@@ -62,18 +63,21 @@ def env_int_list(name: str) -> List[int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔑 TELEGRAM & IDENTITY  (built-in defaults — env vars override when present)
+# 🔑 TELEGRAM & IDENTITY
 # ═══════════════════════════════════════════════════════════════════════════
+# API_ID / API_HASH / OWNER_ID: built-in defaults — env vars override when present.
+# BOT_TOKEN: **environment variable only** (Render dashboard → Environment, Docker
+# `-e BOT_TOKEN=…`, or .env). The bot secret is deliberately NOT stored in the repo.
 # https://my.telegram.org → API development tools · @BotFather → /newbot
 DEFAULT_API_ID = 36681596
 DEFAULT_API_HASH = "bece5a5cb8d1abc08b644410b6e85d5e"
-DEFAULT_BOT_TOKEN = "8795048332:AAGic2dyjDejE3S9AIlyfeCM-HejUDOBKPI"
 # Numeric Telegram ID of the bot owner (approves everyone else). Send /id to the bot.
 DEFAULT_OWNER_ID = 6069200310
 
 API_ID = env_int("API_ID", DEFAULT_API_ID) or DEFAULT_API_ID
 API_HASH = env("API_HASH") or DEFAULT_API_HASH
-BOT_TOKEN = env("BOT_TOKEN") or DEFAULT_BOT_TOKEN
+# Accept a few common aliases so a copy-pasted Render/Heroku variable name still works.
+BOT_TOKEN = env("BOT_TOKEN") or env("TELEGRAM_BOT_TOKEN") or env("TG_BOT_TOKEN")
 OWNER_ID = env_int("OWNER_ID", DEFAULT_OWNER_ID) or DEFAULT_OWNER_ID
 AUTHORIZED_USERS = env_int_list("AUTHORIZED_USERS")
 ADMIN_USERS = env_int_list("ADMIN_USERS")
@@ -87,7 +91,7 @@ LEGACY_USERS = env("LEGACY_USERS", "keep").lower()
 # 📋 BOT IDENTITY & VERSIONING
 # ═══════════════════════════════════════════════════════════════════════════
 BOT_NAME = env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "6.4-master-worker"
+VERSION = "6.5-master-worker"
 SERVICE_ROLE = env("SERVICE_ROLE", "master").lower()  # "master" or "worker"
 WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
 # The master also runs a translation worker in-process by default, so a single
@@ -249,15 +253,44 @@ log = logging.getLogger("noveltranslator")
 BOOT_TS = time.time()
 
 
+# Telegram bot tokens look like "<numeric bot id>:<35 url-safe chars>"; be lenient on
+# the length so future formats still pass, strict on the shape so typos are caught early.
+_BOT_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+
+
+def bot_token_problem(token: str = BOT_TOKEN) -> str:
+    """Return a human readable reason why ``token`` is unusable, or "" when it looks valid."""
+    if not token:
+        return ("BOT_TOKEN is not set. It is the only required environment variable: create the bot with "
+                "@BotFather (/newbot), then add BOT_TOKEN in the Render dashboard → Environment "
+                "(or in .env / `docker run -e BOT_TOKEN=…`) and redeploy.")
+    if token.lower().startswith("bot") and ":" in token:
+        return "BOT_TOKEN must not start with the 'bot' prefix used in HTTP API URLs — paste only the raw token."
+    if ":" not in token:
+        return "BOT_TOKEN is malformed (expected '<bot id>:<secret>' exactly as @BotFather sent it)."
+    if any(ch.isspace() for ch in token) or token.startswith(("'", '"')) or token.endswith(("'", '"')):
+        return "BOT_TOKEN contains spaces or quotes — paste only the raw token without quotes."
+    if not _BOT_TOKEN_RE.match(token):
+        return "BOT_TOKEN does not look like a Telegram bot token ('<numeric id>:<35 letters/digits>')."
+    return ""
+
+
 def validate_config(require_telegram: bool = True, role: str = SERVICE_ROLE) -> None:
-    """Validate the effective configuration (environment variables / .env)."""
+    """Validate the effective configuration (environment variables / .env).
+
+    ``BOT_TOKEN`` has no built-in default, so a missing/malformed token gets its own
+    actionable message; the remaining checks only fire when a built-in default was
+    overridden by an env var with a bad value.
+    """
+    if require_telegram:
+        token_issue = bot_token_problem()
+        if token_issue:
+            raise RuntimeError(token_issue)
     problems = []
     if require_telegram and not API_ID:
         problems.append("API_ID")
     if require_telegram and not API_HASH:
         problems.append("API_HASH")
-    if require_telegram and (not BOT_TOKEN or ":" not in BOT_TOKEN):
-        problems.append("BOT_TOKEN")
     if require_telegram and role == "master" and not OWNER_ID and not PUBLIC_MODE:
         problems.append("OWNER_ID")
     if problems:
