@@ -291,6 +291,54 @@ class MongoDatabase:
         if self.db is not None:
             await self.db.jobs.insert_one({key: value for key, value in job.items() if key != "_id"})
 
+    async def bump_stats(self, user_id: int, parts: int = 0, chars: int = 0,
+                         status: str = "done") -> None:
+        """Atomically credit a finished job to ``users.stats`` and ``stats.global``.
+
+        Workers may run on other nodes than the master, so counters must be
+        ``$inc``-ed in MongoDB rather than kept in one process' RAM. The master's
+        cache re-reads these documents (``Store.sync_from_db``) before serving
+        ``/mystats``, ``/stats`` and the Mini App.
+        """
+        if self.db is None:
+            return
+        now = int(time.time())
+        parts, chars = max(0, int(parts or 0)), max(0, int(chars or 0))
+        if status == "done":
+            user_inc = {"stats.jobs": 1, "stats.parts": parts, "stats.chars": chars}
+            global_inc = {"jobs": 1, "parts": parts, "chars": chars}
+        elif status in ("failed", "cancelled"):
+            user_inc = {}
+            global_inc = {status: 1}
+        else:
+            return
+        try:
+            if user_inc:
+                await self.db.users.update_one({"_id": int(user_id)},
+                                               {"$inc": user_inc, "$set": {"stats_updated": now}})
+            await self.db.stats.update_one({"_id": "global"}, {"$inc": global_inc, "$set": {"updated": now}},
+                                           upsert=True)
+        except Exception as e:
+            log.warning("bump_stats failed for user %s: %s", user_id, e)
+
+    async def user_stats(self, user_id: int) -> Optional[Dict[str, Any]]:
+        if self.db is None:
+            return None
+        doc = await self.db.users.find_one({"_id": int(user_id)}, {"stats": 1})
+        return (doc or {}).get("stats") if doc else None
+
+    async def global_stats(self) -> Optional[Dict[str, Any]]:
+        if self.db is None:
+            return None
+        return await self.db.stats.find_one({"_id": "global"}, {"_id": 0})
+
+    async def history_since(self, ts: int, limit: int = 200) -> list[dict]:
+        """History rows written after ``ts`` (by any node) — newest first."""
+        if self.db is None:
+            return []
+        rows = await self.db.jobs.find({"ts": {"$gt": int(ts)}}, {"_id": 0}).sort("ts", DESCENDING).to_list(limit)
+        return rows
+
     async def close(self) -> None:
         if self.client is not None:
             self.client.close()

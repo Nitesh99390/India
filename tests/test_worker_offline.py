@@ -31,6 +31,8 @@ class FakeDB:
         return j["status"] == "running"
     async def update_job(self, jid, **f): self.jobs.setdefault(jid, {}).update(f)
     async def record_history(self, h): self.hist.append(h)
+    async def bump_stats(self, uid, parts=0, chars=0, status="done"):
+        self.bumps = getattr(self, "bumps", []); self.bumps.append((uid, parts, chars, status))
     async def delete_file(self, fid): self.deleted.append(fid)
     async def heartbeat(self, node, status, cur, **extra): self.hb.append((node, status, cur))
     async def remove_worker(self, node): pass
@@ -98,7 +100,13 @@ async def main():
     assert len(c.docs) == 1 and c.docs[0][0] == "Novel_hi.txt", c.docs
     assert "✅" in c.edits[-1] and d.hist[-1]["status"] == "done" and d.deleted == ["f1"]
     assert w.jobs_done == 1 and w.current_job is None
-    print("✅ success path:", c.docs, "| edits:", len(c.edits))
+    # history row uses the same keys as the legacy runner + counters are $inc-ed
+    h = d.hist[-1]
+    n_chars = h["chars"]                       # normalise_text() trims whitespace → slightly < len(text)
+    assert h["parts"] == 1 and 0.9 * len(text) < n_chars <= len(text) and h["uid"] == 5 and h["job_id"] == "j1", h
+    assert {"secs", "user", "split", "size", "ts", "worker"} <= set(h), h.keys()
+    assert d.bumps == [(5, 1, n_chars, "done")], d.bumps
+    print("✅ success path:", c.docs, "| edits:", len(c.edits), "| bump:", d.bumps)
 
     # 2) cancelled mid-way
     c, d = FakeClient(), FakeDB(src); d.cancel_after = 1
@@ -106,6 +114,7 @@ async def main():
     await w.process(dict(job, job_id="j2"))
     assert d.jobs["j2"]["status"] == "cancelled", d.jobs["j2"]
     assert not c.docs and "🛑" in c.edits[-1] and d.hist[-1]["status"] == "cancelled"
+    assert d.bumps == [(5, 0, 0, "cancelled")], d.bumps      # never credits parts/chars for a cancel
     print("✅ cancel path ok")
 
     # 3) failure (unreadable doc)
@@ -114,7 +123,30 @@ async def main():
     await w.process(dict(job, job_id="j3"))
     assert d.jobs["j3"]["status"] == "failed" and d.jobs["j3"]["error"] == "ValueError"
     assert "⚠️" in c.edits[-1] and w.jobs_failed == 1
+    assert d.bumps == [(5, 0, 0, "failed")] and d.hist[-1]["error"].startswith("ValueError"), (d.bumps, d.hist[-1])
     print("✅ failure path ok:", d.jobs["j3"]["error_text"])
+
+    # 3b) on_finished hook (embedded master) receives the record; hook errors never break the job
+    c, d = FakeClient(), FakeDB(src)
+    w = worker.TranslationWorker(client=c, db=d, embedded=True)
+    seen = []
+    async def hook(entry): seen.append(entry); raise RuntimeError("boom")
+    w.on_finished = hook
+    await w.process(dict(job, job_id="j3b"))
+    assert d.jobs["j3b"]["status"] == "done" and len(seen) == 1 and seen[0]["job_id"] == "j3b" and seen[0]["parts"] == 1
+    print("✅ on_finished hook ok")
+
+    # 3c) a DB without bump_stats (older schema) still works
+    c, d = FakeClient(), FakeDB(src); del FakeDB.bump_stats
+    try:
+        w = worker.TranslationWorker(client=c, db=d, embedded=True)
+        await w.process(dict(job, job_id="j3c"))
+        assert d.jobs["j3c"]["status"] == "done" and d.hist[-1]["status"] == "done"
+    finally:
+        async def _bump(self, uid, parts=0, chars=0, status="done"):
+            self.bumps = getattr(self, "bumps", []); self.bumps.append((uid, parts, chars, status))
+        FakeDB.bump_stats = _bump
+    print("✅ legacy db without bump_stats ok")
 
     # 4) serve()/stop() lifecycle with heartbeat
     c, d = FakeClient(), FakeDB(src)

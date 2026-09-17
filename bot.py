@@ -268,6 +268,11 @@ class Store:
         self.db_checked: float = 0.0
         self.db_pruned_total: int = 0
         self._history_writes = 0                            # inserts since last budget check
+        # cross-node sync: workers write history + $inc stats straight into MongoDB,
+        # the master pulls them into this cache (throttled) before serving views
+        self._synced_ts: int = 0                            # newest history `ts` merged so far
+        self._synced_at: float = 0.0                        # wall clock of the last sync
+        self._sync_lock: Optional[asyncio.Lock] = None
         self._apply_env_roles()
 
     def _apply_env_roles(self) -> None:
@@ -353,7 +358,7 @@ class Store:
                 continue
             doc.pop("_id", None)
             merged = {**self._default_user(doc.get("name", "User")), **doc}
-            merged["stats"] = {**{"jobs": 0, "parts": 0, "chars": 0}, **(doc.get("stats") or {})}
+            merged["stats"] = self._int_stats(doc.get("stats"))
             legacy = "access" not in doc
             if legacy:
                 # v4 user (unlocked with the old security code) → migrate
@@ -399,6 +404,8 @@ class Store:
             dq = self.history.setdefault(int(doc.get("uid", 0)), deque(maxlen=HISTORY_LIMIT))
             if len(dq) < HISTORY_LIMIT:
                 dq.append(doc)
+            self._synced_ts = max(self._synced_ts, int(doc.get("ts", 0) or 0))
+        self._synced_at = time.time()
 
     async def _writer(self) -> None:
         while True:
@@ -517,18 +524,32 @@ class Store:
 
     # ── persistence helpers (fire-and-forget) ──────────────────────────
     def _save_user(self, uid: int) -> None:
+        """Persist profile/prefs/access. ``stats`` is deliberately *not* overwritten:
+        workers ``$inc`` it directly in MongoDB (``MongoDatabase.bump_stats``) and a
+        ``replace_one`` from a stale RAM copy would silently reset jobs/parts/chars."""
         u = self.users.get(uid)
         if u is None:
             return
         snapshot = json.loads(json.dumps(u))
-        self._enqueue(lambda: self.db.users.replace_one({"_id": uid}, snapshot, upsert=True))
+        stats = snapshot.pop("stats", None) or {"jobs": 0, "parts": 0, "chars": 0}
+        self._enqueue(lambda: self.db.users.update_one(
+            {"_id": uid}, {"$set": snapshot, "$setOnInsert": {"stats": stats}}, upsert=True))
 
     def _delete_user(self, uid: int) -> None:
         self._enqueue(lambda: self.db.users.delete_one({"_id": uid}))
 
-    def _save_stats(self) -> None:
-        snapshot = dict(self.stats)
-        self._enqueue(lambda: self.db.stats.replace_one({"_id": "global"}, snapshot, upsert=True))
+    def _inc_stats(self, uid: int, parts: int, chars: int, status: str) -> None:
+        """Atomic counter update shared with the workers (same document layout)."""
+        now = int(time.time())
+        if status == "done":
+            self._enqueue(lambda: self.db.users.update_one(
+                {"_id": uid}, {"$inc": {"stats.jobs": 1, "stats.parts": parts, "stats.chars": chars},
+                               "$set": {"stats_updated": now}}))
+            ginc = {"jobs": 1, "parts": parts, "chars": chars}
+        else:
+            ginc = {status: 1}
+        self._enqueue(lambda: self.db.stats.update_one(
+            {"_id": "global"}, {"$inc": ginc, "$set": {"updated": now}}, upsert=True))
 
     def _save_meta(self) -> None:
         snapshot = {"owner_id": self.owner_id, "updated": int(time.time())}
@@ -839,27 +860,118 @@ class Store:
         self._save_user(uid)
 
     def bump(self, uid: int, parts: int, chars: int, failed=False, cancelled=False):
+        """Credit a job finished *in this process* (legacy RAM queue). Worker-side
+        jobs go through ``MongoDatabase.bump_stats`` and reach the cache via
+        ``sync_from_db`` / ``ingest_finished``."""
+        status = "failed" if failed else "cancelled" if cancelled else "done"
+        parts, chars = max(0, int(parts or 0)), max(0, int(chars or 0))
         u = self.users.get(uid)
-        if u and not failed and not cancelled:
-            u["stats"]["jobs"] += 1
-            u["stats"]["parts"] += parts
-            u["stats"]["chars"] += chars
-            self._save_user(uid)
-        if failed:
-            self.stats["failed"] += 1
-        elif cancelled:
-            self.stats["cancelled"] += 1
-        else:
+        if u and status == "done":
+            st = u.setdefault("stats", {"jobs": 0, "parts": 0, "chars": 0})
+            st["jobs"] = int(st.get("jobs", 0) or 0) + 1
+            st["parts"] = int(st.get("parts", 0) or 0) + parts
+            st["chars"] = int(st.get("chars", 0) or 0) + chars
+        if status == "done":
             self.stats["jobs"] += 1
             self.stats["parts"] += parts
             self.stats["chars"] += chars
-        self._save_stats()
+        else:
+            self.stats[status] += 1
+        self._inc_stats(uid, parts, chars, status)
+
+    @staticmethod
+    def _int_stats(raw: Optional[dict]) -> dict:
+        out = {"jobs": 0, "parts": 0, "chars": 0}
+        for k in out:
+            try:
+                out[k] = int((raw or {}).get(k, 0) or 0)
+            except (TypeError, ValueError):
+                out[k] = 0
+        return out
+
+    def _history_has(self, uid: int, job_id: str) -> bool:
+        dq = self.history.get(uid)
+        return bool(job_id) and dq is not None and any(str(e.get("job_id", "")) == job_id for e in dq)
+
+    def ingest_finished(self, entry: dict) -> bool:
+        """Merge one finished-job record (written by a worker) into the RAM history.
+        Returns True when it was new. Counters are *not* touched here — they are
+        re-read from MongoDB by ``sync_from_db`` so every node sees one truth."""
+        try:
+            uid = int(entry.get("uid", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        job_id = str(entry.get("job_id", "") or "")
+        if not uid or self._history_has(uid, job_id):
+            return False
+        dq = self.history.setdefault(uid, deque(maxlen=HISTORY_LIMIT))
+        row = {k: v for k, v in entry.items() if k != "_id"}
+        row.setdefault("ts", int(time.time()))
+        # keep newest-first order even if rows arrive slightly out of order
+        if dq and dq[0].get("ts", 0) > row["ts"]:
+            items = sorted([*dq, row], key=lambda e: e.get("ts", 0), reverse=True)[:HISTORY_LIMIT]
+            dq.clear()
+            dq.extend(items)
+        else:
+            dq.appendleft(row)
+        self._synced_ts = max(self._synced_ts, int(row["ts"]))
+        return True
+
+    async def sync_from_db(self, force: bool = False, min_interval: float = 2.0) -> int:
+        """Pull history rows and counters written by (other) workers into the cache.
+
+        Cheap: one indexed query on ``jobs`` (``ts > last``) plus one ``users`` read
+        per affected user and one ``stats`` read. Throttled to ``min_interval`` so
+        Mini App polling cannot hammer MongoDB. Returns the number of new rows.
+        """
+        if self.db is None:
+            return 0
+        now = time.time()
+        if not force and now - self._synced_at < min_interval:
+            return 0
+        if self._sync_lock is None:
+            self._sync_lock = asyncio.Lock()
+        if self._sync_lock.locked():
+            return 0
+        async with self._sync_lock:
+            self._synced_at = now
+            added = 0
+            touched: set = set()
+            try:
+                since = max(0, self._synced_ts - 2)          # ts is whole seconds → small overlap + dedupe
+                cursor = self.db.jobs.find({"ts": {"$gt": since}}, {"_id": 0}).sort("ts", -1).limit(500)
+                rows = [d async for d in cursor]
+                for doc in reversed(rows):
+                    # every recent row's owner gets fresh counters — also rows that the
+                    # embedded hook already mirrored into RAM (ingest_finished → False)
+                    touched.add(int(doc.get("uid", 0) or 0))
+                    if self.ingest_finished(doc):
+                        added += 1
+                touched.discard(0)
+                if touched or force:
+                    for uid in touched:
+                        u = self.users.get(uid)
+                        if u is None:
+                            continue
+                        doc = await self.db.users.find_one({"_id": uid}, {"stats": 1})
+                        if doc is not None:
+                            u["stats"] = self._int_stats(doc.get("stats"))
+                    g = await self.db.stats.find_one({"_id": "global"})
+                    if g:
+                        for k in self.stats:
+                            self.stats[k] = int(g.get(k, 0) or 0)
+                if added:
+                    self._history_writes += added
+            except Exception as e:
+                log.debug("sync_from_db: %s", e)
+            return added
 
     # ── job history ────────────────────────────────────────────────────
     def add_history(self, uid: int, entry: dict) -> None:
         entry = {"uid": uid, "ts": int(time.time()), **entry}
         dq = self.history.setdefault(uid, deque(maxlen=HISTORY_LIMIT))
         dq.appendleft(entry)
+        self._synced_ts = max(self._synced_ts, int(entry["ts"]))
         snapshot = {k: v for k, v in entry.items() if k != "error" or v}
         if isinstance(snapshot.get("error"), str):
             snapshot["error"] = snapshot["error"][:200]      # keep job docs tiny
@@ -1802,6 +1914,7 @@ async def janitor():
         await asyncio.sleep(300)
         now = time.time()
         if store.connected:
+            await store.sync_from_db(force=True)      # pick up jobs finished by external workers
             await store.check_budget()
         try:
             await access_sweep()
@@ -2605,6 +2718,7 @@ def text_mystats(uid: int) -> str:
 @app.on_message(filters.command("mystats") & PRIVATE & authorized)
 async def cmd_mystats(_, m: Message):
     touch_user(m)
+    await store.sync_from_db()
     await m.reply(text_mystats(m.from_user.id), reply_markup=back_home_kb())
 
 @app.on_message(filters.command("id") & PRIVATE)
@@ -2649,6 +2763,7 @@ def text_owner() -> str:
 
 @app.on_message(filters.command("stats") & PRIVATE & owner_only)
 async def cmd_stats(_, m: Message):
+    await store.sync_from_db()
     await m.reply(text_owner(), reply_markup=back_home_kb())
 
 def _parse_target(m: Message, _usage: str = "") -> Optional[int]:
@@ -3190,8 +3305,10 @@ async def callbacks(_, q: CallbackQuery):
                 InlineKeyboardButton("🔄 Refresh", callback_data="nav:queue"),
                 InlineKeyboardButton("🏠 Home", callback_data="nav:home")]]))
         elif arg1 == "mystats":
+            await store.sync_from_db()
             await _edit(q, text_mystats(uid), back_home_kb())
         elif arg1 == "owner" and store.is_owner(uid):
+            await store.sync_from_db()
             await _edit(q, text_owner(), InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Refresh", callback_data="nav:owner"),
                 InlineKeyboardButton("🏠 Home", callback_data="nav:home")]]))
@@ -3604,6 +3721,7 @@ async def api_me(request: web.Request) -> web.Response:
     tg, err = _require(request)
     if err:
         return err
+    await store.sync_from_db()
     return _json({"ok": True, "me": _me_payload(tg), "config": _config_public()})
 
 async def api_access(request: web.Request) -> web.Response:
@@ -3698,6 +3816,7 @@ async def api_jobs(request: web.Request) -> web.Response:
         queue = [_job_public_doc(j, uid, index) for index, j in enumerate(
             [j for j in persisted if j.get("status") == "queued"], 1)]
     pending = [_job_public(j, uid) for j in PENDING.values() if j.user_id == uid]
+    await store.sync_from_db()
     history = store.user_history(uid, 25)
     return _json({"ok": True, "active": active, "queue": queue, "pending": pending, "history": history,
                   "queue_len": len(queue), "global": store.stats if owner else None,
@@ -3780,6 +3899,7 @@ async def api_admin_overview(request: web.Request) -> web.Response:
     if err:
         return err
     owner = store.is_owner(tg["id"])
+    await store.sync_from_db()
     users = [_user_public(uid, u) for uid, u in store.users.items()]
     users.sort(key=lambda x: (_STATUS_ORDER.get(x["access"]["status"], 9), -x["last_seen"]))
     workers = await QUEUE_REPO.workers() if QUEUE_REPO else []
@@ -3819,6 +3939,7 @@ async def api_admin_user(request: web.Request) -> web.Response:
     u = store.user(uid)
     if not u:
         return _err("Unknown user", 404)
+    await store.sync_from_db()
     return _json({"ok": True, "user": _user_public(uid, u), "history": store.user_history(uid, 15)})
 
 async def api_admin_users(request: web.Request) -> web.Response:
@@ -4114,6 +4235,21 @@ async def shutdown_jobs():
     if QUEUE_WAKE:
         QUEUE_WAKE.set()
 
+async def _embedded_job_finished(entry: dict) -> None:
+    """Embedded-worker hook: the worker already wrote the history row and
+    ``$inc``-ed the counters in MongoDB; mirror the row into the RAM cache right
+    away and re-read the counters so the very next Mini App poll is correct."""
+    store.ingest_finished(entry)
+    await store.sync_from_db(force=True)
+    if BACKUP_GROUP_ID and entry.get("status") == "done":
+        await safe_send(BACKUP_GROUP_ID,
+                        header("Job Completed", "✅") +
+                        f"📘 {b(entry.get('name', 'Document'))}\n"
+                        f"👤 {b(entry.get('user') or entry.get('uid'))} ({code(entry.get('uid'))})\n"
+                        f"🌐 {b(lang_label(entry.get('lang', DEFAULT_LANG)))} · 📄 {b(str(entry.get('fmt', '')).upper())}\n"
+                        f"🧩 Parts: {b(entry.get('parts', 0))}  ·  🔤 Chars: {b(fmt_int(entry.get('chars', 0)))}"
+                        f"  ·  ⏱ {b(fmt_time(entry.get('secs', 0)))}")
+
 async def main():
     global QUEUE_WAKE, BOT_USERNAME, QUEUE_REPO, EMBEDDED
     QUEUE_WAKE = asyncio.Event()
@@ -4162,6 +4298,7 @@ async def main():
     if EMBEDDED_WORKER and QUEUE_REPO:
         from worker import TranslationWorker
         EMBEDDED = TranslationWorker(client=app, db=QUEUE_REPO, embedded=True)
+        EMBEDDED.on_finished = _embedded_job_finished
         tasks.append(asyncio.create_task(EMBEDDED.serve(), name="embedded_worker"))
         log.info("Embedded worker %s started (set EMBEDDED_WORKER=0 for a polling-only master)", EMBEDDED.node_id)
     elif EMBEDDED_WORKER:

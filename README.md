@@ -1,6 +1,6 @@
 # 📚 NovelTranslator PRO — Telegram Document Translation Bot
 
-**v6.5 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
+**v6.6 · Master + embedded/extra workers · GridFS + approval-based access, built for the Render.com free tier.**
 
 The master process (Pyrogram + aiohttp) accepts Telegram updates and — by default —
 also runs a translation worker in-process, so **one free Render service is a complete
@@ -86,6 +86,7 @@ deliver the result as TXT, DOCX or EPUB — split into parts of any size you lik
 | Per-user cap | `MAX_JOBS_PER_USER` counts RAM *and* persisted queued/running jobs. |
 | Queue hygiene | Finished queue documents are pruned after `QUEUE_DONE_KEEP_H` (24 h); history lives in `jobs`. Any GridFS source still attached to a pruned document is deleted with it. |
 | GridFS hygiene (v6.4) | Uploads happen *before* the options wizard, so an abandoned wizard, a master restart mid-wizard or a worker crash between delivery and cleanup used to leave the source in `documents.*` forever. Now a wizard that is discarded/expired deletes its upload immediately, and every worker's `recover_loop` (or the master janitor) runs `prune_orphan_files()` each minute: any GridFS file older than `ORPHAN_FILE_AGE_H` (2 h) that no queued/running job references is removed. `/health` reports `gridfs: {files, mb}`. |
+| Stats & history sync (v6.6) | **Bug fixed:** jobs finished by a worker (embedded or standalone) were written to `jobs` history but *never* credited to `users.stats` / `stats.global`, so `/mystats`, owner `/stats` and the Mini App showed `Files 0 · Parts 0 · Chars 0` forever — and the master's `replace_one` of a stale RAM user document could even wipe counters. Now the worker calls `MongoDatabase.bump_stats()` (atomic `$inc` on both documents, shared layout with the legacy in-process `Store.bump()`), the master merges history + counters from MongoDB via `Store.sync_from_db()` (throttled, before `/mystats`, `/stats`, `/api/me`, `/api/jobs`, admin views and every janitor tick), the embedded worker's `on_finished` hook mirrors the result instantly, and `Store._save_user()` no longer touches `stats`. Failed/cancelled jobs are listed in history but never credited. |
 
 All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `BOT_TOKEN`. Add more Render worker services with unique `WORKER_NODE_ID` values; the admin Mini App shows nodes (with an `embedded` badge, jobs done/failed and heartbeat age) whose heartbeat was received within the last 90 seconds. `/health` reports `role: master+worker`, the embedded worker status and online/busy worker counts.
 

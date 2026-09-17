@@ -83,6 +83,10 @@ class TranslationWorker:
         self.jobs_failed = 0
         self.started = time.time()
         self.runner: Optional[web.AppRunner] = None
+        # Optional callback set by the master for the embedded worker: receives
+        # every finished-job record so the master's RAM cache (history + stats)
+        # reflects the result immediately instead of on the next DB sync.
+        self.on_finished = None
 
     # ── telegram helpers (never raise) ────────────────────────────────────
     async def _send(self, chat_id: int, text: str, **kw):
@@ -203,6 +207,42 @@ class TranslationWorker:
                 except asyncio.TimeoutError:
                     pass
 
+    # ── bookkeeping ───────────────────────────────────────────────────────
+    async def _finish(self, job: dict, status: str, *, parts: int, chars: int, secs: int,
+                      error: str = "") -> dict:
+        """Persist one finished job: history row (``jobs``) + atomic counters
+        (``users.stats`` / ``stats.global``). Uses the same keys as the legacy
+        in-process runner so the Mini App / ``/mystats`` render both identically.
+        Never raises — a bookkeeping failure must not turn a delivered job into a
+        failed one."""
+        uid = int(job.get("user_id", 0) or 0)
+        entry = {"uid": uid, "job_id": str(job["job_id"]), "name": job.get("name", "Document"),
+                 "lang": job.get("lang", "hi"), "fmt": job.get("fmt", "txt"),
+                 "split": int(job.get("split_kb", 0) or 0), "size": int(job.get("size", 0) or 0),
+                 "parts": int(parts), "chars": int(chars), "secs": int(secs), "status": status,
+                 "user": job.get("user_name", ""), "worker": self.node_id, "ts": int(time.time())}
+        if error:
+            entry["error"] = error[:200]
+        try:
+            await self.db.record_history(dict(entry))
+        except Exception as e:
+            log.warning("record_history failed for job %s: %s", entry["job_id"], e)
+        bump = getattr(self.db, "bump_stats", None)
+        if bump is not None:
+            try:
+                await bump(uid, parts=parts if status == "done" else 0,
+                           chars=chars if status == "done" else 0, status=status)
+            except Exception as e:
+                log.warning("bump_stats failed for job %s: %s", entry["job_id"], e)
+        if self.on_finished is not None:
+            try:
+                result = self.on_finished(dict(entry))
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                log.debug("on_finished hook failed: %s", e)
+        return entry
+
     # ── one job ───────────────────────────────────────────────────────────
     async def process(self, job: dict) -> None:
         job_id = str(job["job_id"])
@@ -283,19 +323,15 @@ class TranslationWorker:
                              f"✅ <b>Completed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                              f"🌐 {_lang_label(lang)} · 📄 {fmt.upper()} · 📑 {n_parts} part{'s' if n_parts != 1 else ''}\n"
                              f"🔤 {len(text):,} characters · ⏱ {_fmt_eta(elapsed)}")
-            await self.db.record_history({"uid": job["user_id"], "job_id": job_id, "name": name, "lang": lang,
-                                          "fmt": fmt, "split": job.get("split_kb", 0), "size": job.get("size", 0),
-                                          "parts": n_parts, "chars": len(text), "status": "done",
-                                          "elapsed": elapsed, "worker": self.node_id, "ts": int(time.time())})
+            await self._finish(job, "done", parts=n_parts, chars=len(text), secs=elapsed)
             self.jobs_done += 1
             log.info("job %s done (%d parts, %d chars, %ds)", job_id, n_parts, len(text), elapsed)
         except JobCancelled:
             await self.db.update_job(job_id, status="cancelled", finished_at=time.time())
             await self._edit(chat_id, msg_id, f"🛑 <b>Cancelled</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>"
                              + (f"\n📤 {parts_sent} part(s) were already delivered." if parts_sent else ""))
-            await self.db.record_history({"uid": job["user_id"], "job_id": job_id, "name": name, "lang": lang,
-                                          "fmt": fmt, "parts": parts_sent, "chars": len(text),
-                                          "status": "cancelled", "ts": int(time.time())})
+            await self._finish(job, "cancelled", parts=parts_sent, chars=len(text),
+                               secs=int(time.time() - started))
             log.info("job %s cancelled", job_id)
         except asyncio.CancelledError:
             # worker is shutting down — give the job back so another node picks it up
@@ -316,9 +352,9 @@ class TranslationWorker:
                              f"⚠️ <b>Translation failed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                              f"❗ {html.escape(type(error).__name__)}: {html.escape(str(error)[:120])}\n"
                              "Please try again in a few minutes.")
-            await self.db.record_history({"uid": job["user_id"], "job_id": job_id, "name": name, "lang": lang,
-                                          "fmt": fmt, "parts": parts_sent, "chars": len(text), "status": "failed",
-                                          "error": str(error)[:200], "ts": int(time.time())})
+            await self._finish(job, "failed", parts=parts_sent, chars=len(text),
+                               secs=int(time.time() - started),
+                               error=f"{type(error).__name__}: {error}")
         finally:
             if not keep_source:
                 await self.db.delete_file(str(job.get("file_id", "")))
