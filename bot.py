@@ -4236,19 +4236,13 @@ async def shutdown_jobs():
         QUEUE_WAKE.set()
 
 async def _embedded_job_finished(entry: dict) -> None:
-    """Embedded-worker hook: the worker already wrote the history row and
-    ``$inc``-ed the counters in MongoDB; mirror the row into the RAM cache right
-    away and re-read the counters so the very next Mini App poll is correct."""
+    """Embedded-worker hook: the worker already wrote the history row,
+    ``$inc``-ed the counters in MongoDB and posted the backup-group summary
+    (v6.7: the worker owns the backup topic for its job). Mirror the row into
+    the RAM cache right away and re-read the counters so the very next Mini App
+    poll is correct."""
     store.ingest_finished(entry)
     await store.sync_from_db(force=True)
-    if BACKUP_GROUP_ID and entry.get("status") == "done":
-        await safe_send(BACKUP_GROUP_ID,
-                        header("Job Completed", "✅") +
-                        f"📘 {b(entry.get('name', 'Document'))}\n"
-                        f"👤 {b(entry.get('user') or entry.get('uid'))} ({code(entry.get('uid'))})\n"
-                        f"🌐 {b(lang_label(entry.get('lang', DEFAULT_LANG)))} · 📄 {b(str(entry.get('fmt', '')).upper())}\n"
-                        f"🧩 Parts: {b(entry.get('parts', 0))}  ·  🔤 Chars: {b(fmt_int(entry.get('chars', 0)))}"
-                        f"  ·  ⏱ {b(fmt_time(entry.get('secs', 0)))}")
 
 async def main():
     global QUEUE_WAKE, BOT_USERNAME, QUEUE_REPO, EMBEDDED

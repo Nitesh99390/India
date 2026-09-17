@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render Blueprint — NovelTranslator PRO v6.5 (master + embedded worker · MongoDB GridFS)
+#  Render Blueprint — NovelTranslator PRO v6.7 (master + embedded worker · MongoDB GridFS)
 #  Dashboard → New → Blueprint → pick this repo → Apply. ONE thing to fill in:
 #  BOT_TOKEN (from @BotFather) — Render prompts for it because `sync: false`.
 #  API_ID · API_HASH · OWNER_ID · MONGO_URI have working built-in defaults in
