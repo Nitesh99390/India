@@ -91,7 +91,7 @@ LEGACY_USERS = env("LEGACY_USERS", "keep").lower()
 # 📋 BOT IDENTITY & VERSIONING
 # ═══════════════════════════════════════════════════════════════════════════
 BOT_NAME = env("BOT_NAME", "NovelTranslator PRO")
-VERSION = "6.6-master-worker"
+VERSION = "6.7-master-worker"
 SERVICE_ROLE = env("SERVICE_ROLE", "master").lower()  # "master" or "worker"
 WORKER_NODE_ID = env("WORKER_NODE_ID", "worker-local")
 # The master also runs a translation worker in-process by default, so a single

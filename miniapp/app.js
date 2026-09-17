@@ -293,7 +293,7 @@
   }
   function histRow(h) {
     return `<div class="job" data-id="${esc(h.job_id || (h.name + "|" + h.ts))}"><div class="job-head"><div class="job-name">${esc(h.name)}</div><span class="status ${esc(h.status)}">${esc(h.status)}</span></div>
-      <div class="job-meta">${langLabel(h.lang)} · ${fmtLabel(h.fmt)} · ${fmtSize(h.size)}${h.parts ? " · " + h.parts + " parts" : ""}${h.chars ? " · " + fmtInt(h.chars) + " chars" : ""}${h.secs ? " · " + fmtTime(h.secs) : ""}${h.error ? " · " + esc(h.error) : ""}${h.user && isOwner() ? " · 👤 " + esc(h.user) : ""} · ${fmtAgo(h.ts)}</div></div>`;
+      <div class="job-meta">${langLabel(h.lang)} · ${fmtLabel(h.fmt)} · ${fmtSize(h.size)}${h.parts ? " · " + h.parts + " parts" : ""}${h.chars ? " · " + fmtInt(h.chars) + " chars" : ""}${h.secs ? " · " + fmtTime(h.secs) : ""}${h.failed_chunks ? " · ⚠️ " + h.failed_chunks + " untranslated" : ""}${h.error ? " · " + esc(h.error) : ""}${h.user && isOwner() ? " · 👤 " + esc(h.user) : ""} · ${fmtAgo(h.ts)}</div></div>`;
   }
   document.addEventListener("click", async (ev) => {
     const c = ev.target.closest("[data-cancel]");

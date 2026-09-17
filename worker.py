@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import random
+import re
 import shutil
 import tempfile
 import time
@@ -29,8 +31,8 @@ from aiohttp import web
 from pyrogram import Client, enums
 from pyrogram.errors import FloodWait
 
-from config import (API_HASH, API_ID, BOT_TOKEN, CONCURRENCY_LIMIT, EDIT_INTERVAL, LANGUAGES, PORT,
-                    VERSION, WORKER_HEARTBEAT_INTERVAL, WORKER_NODE_ID, WORKER_POLL_INTERVAL,
+from config import (API_HASH, API_ID, BACKUP_GROUP_ID, BOT_TOKEN, CONCURRENCY_LIMIT, EDIT_INTERVAL, EXPANSION,
+                    LANGUAGES, PORT, VERSION, WORKER_HEARTBEAT_INTERVAL, WORKER_NODE_ID, WORKER_POLL_INTERVAL,
                     validate_config)
 from database import MongoDatabase
 from translator import (EXTRACTORS, WRITERS, TranslationEngine, build_chunks, close_http, normalise_text,
@@ -63,6 +65,30 @@ def _lang_label(code: str) -> str:
     return f"{flag} {name}".strip()
 
 
+def _fmt_size(num: float) -> str:
+    num = float(num or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024 or unit == "GB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} GB"
+
+
+_UNSAFE_FN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name: str) -> str:
+    """Strip path separators / control characters so the delivered file keeps the novel's title."""
+    name = _UNSAFE_FN.sub("", str(name or "")).strip(" .")
+    return name[:90] or "Document"
+
+
+def split_factor(lang: str) -> float:
+    """Expected output/input byte ratio for ``lang`` (Hindi ≈ 2.6×, Chinese ≈ 0.9×).
+    Used so the *delivered* parts respect the user's split size, not the source."""
+    return float(EXPANSION.get(lang, 1.15))
+
+
 class TranslationWorker:
     """Claims queued jobs, translates them and delivers the output via Telegram."""
 
@@ -83,6 +109,8 @@ class TranslationWorker:
         self.jobs_failed = 0
         self.started = time.time()
         self.runner: Optional[web.AppRunner] = None
+        # Backup group (0 = disabled). Overridable per instance for tests / masters.
+        self.backup_group: int = int(BACKUP_GROUP_ID or 0)
         # Optional callback set by the master for the embedded worker: receives
         # every finished-job record so the master's RAM cache (history + stats)
         # reflects the result immediately instead of on the next DB sync.
@@ -123,6 +151,48 @@ class TranslationWorker:
                 log.warning("send_document failed (attempt %d): %s", attempt + 1, e)
                 await asyncio.sleep(3 * (attempt + 1))
         return False
+
+    # ── backup group (optional, BACKUP_GROUP_ID) ──────────────────────────
+    # Every worker — embedded or standalone — mirrors what it delivers into the
+    # owner's backup group: one forum topic per job (when the group has topics
+    # enabled), a "New Job" card, every delivered part and a final summary.
+    # All of it is best-effort: the group must never break a user's job.
+    async def _backup_topic(self, title: str) -> Optional[int]:
+        if not self.backup_group:
+            return None
+        try:
+            from pyrogram.raw import functions
+            peer = await self.client.resolve_peer(self.backup_group)
+            result = await self.client.invoke(functions.channels.CreateForumTopic(
+                channel=peer, title=str(title)[:128], random_id=random.randint(1, 2 ** 62)))
+            for upd in getattr(result, "updates", []) or []:
+                msg = getattr(upd, "message", None)
+                if msg is not None and hasattr(msg, "id"):
+                    return int(msg.id)
+        except Exception as e:
+            log.debug("backup topic not created (forum topics disabled?): %s", e)
+        return None
+
+    async def _backup_text(self, text: str, topic_id: Optional[int]) -> None:
+        if not self.backup_group:
+            return
+        kw = {"reply_to_message_id": topic_id} if topic_id else {}
+        await self._send(self.backup_group, text, **kw)
+
+    async def _backup_document(self, path: str, caption: str, topic_id: Optional[int]) -> None:
+        if not self.backup_group:
+            return
+        kw = {"reply_to_message_id": topic_id} if topic_id else {}
+        try:
+            await self.client.send_document(self.backup_group, path, caption=caption, **kw)
+        except FloodWait as e:
+            await asyncio.sleep(min(float(e.value) + 1, 60))
+            try:
+                await self.client.send_document(self.backup_group, path, caption=caption, **kw)
+            except Exception as e2:
+                log.debug("backup send_document failed: %s", e2)
+        except Exception as e:
+            log.debug("backup send_document failed: %s", e)
 
     # ── http health (standalone only) ─────────────────────────────────────
     def status(self) -> dict:
@@ -209,7 +279,7 @@ class TranslationWorker:
 
     # ── bookkeeping ───────────────────────────────────────────────────────
     async def _finish(self, job: dict, status: str, *, parts: int, chars: int, secs: int,
-                      error: str = "") -> dict:
+                      error: str = "", failed_chunks: int = 0) -> dict:
         """Persist one finished job: history row (``jobs``) + atomic counters
         (``users.stats`` / ``stats.global``). Uses the same keys as the legacy
         in-process runner so the Mini App / ``/mystats`` render both identically.
@@ -223,6 +293,8 @@ class TranslationWorker:
                  "user": job.get("user_name", ""), "worker": self.node_id, "ts": int(time.time())}
         if error:
             entry["error"] = error[:200]
+        if failed_chunks:
+            entry["failed_chunks"] = int(failed_chunks)
         try:
             await self.db.record_history(dict(entry))
         except Exception as e:
@@ -259,8 +331,12 @@ class TranslationWorker:
         last_edit = 0.0
         started = time.time()
         parts_sent = 0
+        failed_chunks = 0
         text = ""
         keep_source = False
+        topic_id: Optional[int] = None
+        user_tag = (f"👤 {html.escape(str(job.get('user_name') or job.get('user_id', '')))} "
+                    f"(<code>{job.get('user_id', '')}</code>)")
         try:
             await self.db.download_to(str(job["file_id"]), str(source))
             if not await self.db.touch_job(job_id, {"phase": "extracting", "ratio": 0}):
@@ -270,8 +346,19 @@ class TranslationWorker:
             text = normalise_text(await asyncio.to_thread(extractor, str(source)))
             if len(text) < 20:
                 raise ValueError("No readable text found in the document")
-            parts = split_text_by_size(text, int(job.get("split_kb") or 0), 1.15)
+            # Output-aware split: Hindi/Bengali… outputs are ~2.6× the source bytes, so the
+            # *delivered* parts — not the source slices — must respect the user's split size.
+            parts = split_text_by_size(text, int(job.get("split_kb") or 0), split_factor(lang))
             n_parts = len(parts)
+            stem = safe_filename(Path(safe_filename(name)).stem or name)   # sanitise BEFORE .stem: "My/Novel.epub" → "MyNovel"
+
+            if self.backup_group:
+                topic_id = await self._backup_topic(name)
+                await self._backup_text(
+                    f"📥 <b>New Job</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
+                    f"🌐 {_lang_label(lang)} · 📄 {fmt.upper()} · 💾 {_fmt_size(job.get('size', 0))}\n"
+                    f"{user_tag}\n🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{len(text):,}</b>"
+                    f" · 🖥 <code>{html.escape(self.node_id)}</code>", topic_id)
 
             for part_index, part in enumerate(parts, 1):
                 engine = TranslationEngine(lang, CONCURRENCY_LIMIT)
@@ -303,33 +390,46 @@ class TranslationWorker:
                     raise
                 if cancel.is_set():
                     raise JobCancelled()
-                output = temp_dir / f"{Path(name).stem or 'translation'}_{lang}_part{part_index:02d}.{fmt}"
-                if n_parts == 1:
-                    output = temp_dir / f"{Path(name).stem or 'translation'}_{lang}.{fmt}"
-                await asyncio.to_thread(WRITERS[fmt], translated, str(output), name, lang)
-                caption = f"📘 <b>{html.escape(name)}</b> · {_lang_label(lang)}"
-                if n_parts > 1:
-                    caption += f" · Part {part_index}/{n_parts}"
+                failed_chunks += engine.failed
+                await self._edit(chat_id, msg_id, head + f"📝 Building part {part_index}/{n_parts} (.{fmt})…")
+                output = temp_dir / (f"{stem}_{lang}_part{part_index:02d}.{fmt}" if n_parts > 1
+                                     else f"{stem}_{lang}.{fmt}")
+                part_title = f"{name} — Part {part_index} of {n_parts}" if n_parts > 1 else name
+                await asyncio.to_thread(WRITERS[fmt], translated, str(output), part_title, lang)
+                caption = (f"📘 <b>{html.escape(name)}</b>\n"
+                           f"📦 Part {part_index} / {n_parts} · 🌐 {_lang_label(lang)}\n"
+                           f"💾 {_fmt_size(output.stat().st_size)}")
                 if not await self._send_document(chat_id, str(output), caption):
                     raise RuntimeError("Telegram upload failed")
                 parts_sent += 1
+                await self._backup_document(str(output), caption + "\n" + user_tag, topic_id)
                 output.unlink(missing_ok=True)
+                last_edit = 0.0                       # next part's first progress edit goes out immediately
 
             elapsed = int(time.time() - started)
             await self.db.update_job(job_id, status="done", finished_at=time.time(),
                                      progress={"phase": "complete", "ratio": 1, "parts": n_parts, "chars": len(text),
-                                               "elapsed": elapsed})
+                                               "elapsed": elapsed, "failed_chunks": failed_chunks})
+            warn = (f"\n⚠️ {failed_chunks} chunk{'s' if failed_chunks != 1 else ''} could not be translated "
+                    "and were kept in the original language.") if failed_chunks else ""
             await self._edit(chat_id, msg_id,
                              f"✅ <b>Completed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                              f"🌐 {_lang_label(lang)} · 📄 {fmt.upper()} · 📑 {n_parts} part{'s' if n_parts != 1 else ''}\n"
-                             f"🔤 {len(text):,} characters · ⏱ {_fmt_eta(elapsed)}")
-            await self._finish(job, "done", parts=n_parts, chars=len(text), secs=elapsed)
+                             f"🔤 {len(text):,} characters · ⏱ {_fmt_eta(elapsed)}{warn}")
+            await self._backup_text(
+                f"✅ <b>Job Completed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n{user_tag}\n"
+                f"🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{len(text):,}</b> · ⏱ <b>{_fmt_eta(elapsed)}</b>"
+                + (f"\n⚠️ {failed_chunks} untranslated chunk(s)" if failed_chunks else ""), topic_id)
+            await self._finish(job, "done", parts=n_parts, chars=len(text), secs=elapsed, failed_chunks=failed_chunks)
             self.jobs_done += 1
-            log.info("job %s done (%d parts, %d chars, %ds)", job_id, n_parts, len(text), elapsed)
+            log.info("job %s done (%d parts, %d chars, %ds, %d failed chunks)", job_id, n_parts, len(text), elapsed,
+                     failed_chunks)
         except JobCancelled:
             await self.db.update_job(job_id, status="cancelled", finished_at=time.time())
             await self._edit(chat_id, msg_id, f"🛑 <b>Cancelled</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>"
                              + (f"\n📤 {parts_sent} part(s) were already delivered." if parts_sent else ""))
+            await self._backup_text(f"🛑 Job cancelled: <b>{html.escape(name)}</b> · {user_tag}"
+                                    + (f" · {parts_sent} part(s) delivered" if parts_sent else ""), topic_id)
             await self._finish(job, "cancelled", parts=parts_sent, chars=len(text),
                                secs=int(time.time() - started))
             log.info("job %s cancelled", job_id)
@@ -352,6 +452,8 @@ class TranslationWorker:
                              f"⚠️ <b>Translation failed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                              f"❗ {html.escape(type(error).__name__)}: {html.escape(str(error)[:120])}\n"
                              "Please try again in a few minutes.")
+            await self._backup_text(f"⚠️ Job failed: <b>{html.escape(name)}</b> · {user_tag}\n"
+                                    f"❗ {html.escape(type(error).__name__)}: {html.escape(str(error)[:160])}", topic_id)
             await self._finish(job, "failed", parts=parts_sent, chars=len(text),
                                secs=int(time.time() - started),
                                error=f"{type(error).__name__}: {error}")

@@ -11,11 +11,29 @@ class Msg:  # fake telegram message
     def __init__(self, i): self.id = i
 
 class FakeClient:
-    def __init__(self): self.sent=[]; self.edits=[]; self.docs=[]
-    async def send_message(self, chat_id, text, **kw): self.sent.append(text); return Msg(len(self.sent))
+    """Records every Telegram call; ``group`` collects what lands in the backup group."""
+    def __init__(self, backup_group=0):
+        self.sent=[]; self.edits=[]; self.docs=[]; self.group=[]; self.backup_group = backup_group
+        self.topics = 0; self.topic_fail = False
+    async def send_message(self, chat_id, text, **kw):
+        if self.backup_group and chat_id == self.backup_group:
+            self.group.append(("text", text, kw.get("reply_to_message_id"))); return Msg(900 + len(self.group))
+        self.sent.append(text); return Msg(len(self.sent))
     async def edit_message_text(self, chat_id, mid, text, **kw): self.edits.append(text)
     async def send_document(self, chat_id, path, caption=None, **kw):
-        assert os.path.exists(path); self.docs.append((os.path.basename(path), caption)); return True
+        assert os.path.exists(path)
+        if self.backup_group and chat_id == self.backup_group:
+            self.group.append(("doc", os.path.basename(path), kw.get("reply_to_message_id"))); return True
+        self.docs.append((os.path.basename(path), caption)); return True
+    # raw API used by _backup_topic (forum topics)
+    async def resolve_peer(self, chat_id): return ("peer", chat_id)
+    async def invoke(self, query):
+        if self.topic_fail: raise RuntimeError("TOPICS_DISABLED")
+        self.topics += 1
+        class U:  # one update carrying the topic's service message
+            message = Msg(500 + self.topics)
+        class R: updates = [U()]
+        return R()
 
 class FakeDB:
     connected = True; db_name = "fake"
@@ -147,6 +165,78 @@ async def main():
             self.bumps = getattr(self, "bumps", []); self.bumps.append((uid, parts, chars, status))
         FakeDB.bump_stats = _bump
     print("✅ legacy db without bump_stats ok")
+
+    # 3d) v6.7 — output-aware split: Hindi output is ~2.6× the source, so a 100 KB split of a
+    #     ~40 KB English source must yield several parts (legacy factor 1.15 would give 1)
+    assert worker.split_factor("hi") == 2.6 and worker.split_factor("zh-CN") == 0.9 and worker.split_factor("xx") == 1.15
+    c, d = FakeClient(), FakeDB(src)
+    w = worker.TranslationWorker(client=c, db=d, embedded=True)
+    await w.process(dict(job, job_id="j3d", split_kb=100))
+    n = d.jobs["j3d"]["progress"]["parts"]
+    assert n == len(c.docs) >= 2, (n, c.docs)
+    assert c.docs[0][0] == "Novel_hi_part01.txt" and c.docs[-1][0] == f"Novel_hi_part{n:02d}.txt", c.docs
+    assert "Part 1 / %d" % n in c.docs[0][1] and "💾" in c.docs[0][1], c.docs[0][1]
+    assert d.hist[-1]["parts"] == n and d.bumps == [(5, n, d.hist[-1]["chars"], "done")], (d.hist[-1], d.bumps)
+    # …while a script that shrinks (Chinese) keeps the bigger, fewer parts
+    c2, d2 = FakeClient(), FakeDB(src)
+    await worker.TranslationWorker(client=c2, db=d2, embedded=True).process(dict(job, job_id="j3d2", split_kb=100, lang="zh-CN"))
+    assert d2.jobs["j3d2"]["progress"]["parts"] < n, (d2.jobs["j3d2"]["progress"]["parts"], n)
+    print(f"✅ output-aware split ok: hi → {n} parts, zh-CN → {d2.jobs['j3d2']['progress']['parts']} part(s)")
+
+    # 3e) v6.7 — unsafe titles never leak path separators into the delivered file name
+    c, d = FakeClient(), FakeDB(src)
+    await worker.TranslationWorker(client=c, db=d, embedded=True).process(dict(job, job_id="j3e", name='My/Novel: "Vol<1>".epub'))
+    assert c.docs[0][0] == "MyNovel Vol1_hi.txt", c.docs
+    assert worker.safe_filename("../../etc/passwd") == "etcpasswd" and worker.safe_filename("  ") == "Document"
+    print("✅ safe filename ok:", c.docs[0][0])
+
+    # 3f) v6.7 — backup group: topic per job, New Job card, every part mirrored, completion summary
+    c, d = FakeClient(backup_group=-100), FakeDB(src)
+    w = worker.TranslationWorker(client=c, db=d, embedded=True); w.backup_group = -100
+    await w.process(dict(job, job_id="j3f", split_kb=100))
+    kinds = [g[0] for g in c.group]
+    assert c.topics == 1 and kinds[0] == "text" and "New Job" in c.group[0][1] and kinds.count("doc") == n, (c.topics, kinds)
+    assert "Job Completed" in c.group[-1][1] and all(g[2] == 501 for g in c.group), c.group   # all inside the topic
+    assert len(c.docs) == n and d.jobs["j3f"]["status"] == "done"                           # user delivery unaffected
+    print(f"✅ backup group ok: topic + {kinds.count('doc')} mirrored parts + summary")
+
+    # 3g) backup group without forum topics (or any group error) must never break the job
+    c, d = FakeClient(backup_group=-100), FakeDB(src); c.topic_fail = True
+    w = worker.TranslationWorker(client=c, db=d, embedded=True); w.backup_group = -100
+    await w.process(dict(job, job_id="j3g"))
+    assert d.jobs["j3g"]["status"] == "done" and c.topics == 0 and all(g[2] is None for g in c.group) and len(c.group) == 3, c.group
+    # cancelled / failed jobs post a one-line note to the group as well
+    c, d = FakeClient(backup_group=-100), FakeDB(src); d.cancel_after = 1
+    w = worker.TranslationWorker(client=c, db=d, embedded=True); w.backup_group = -100
+    await w.process(dict(job, job_id="j3g2"))
+    assert "cancelled" in c.group[-1][1].lower(), c.group[-1]
+    c, d = FakeClient(backup_group=-100), FakeDB(b"x")
+    w = worker.TranslationWorker(client=c, db=d, embedded=True); w.backup_group = -100
+    await w.process(dict(job, job_id="j3g3"))
+    assert "failed" in c.group[-1][1].lower() and "ValueError" in c.group[-1][1], c.group[-1]
+    # disabled (default BACKUP_GROUP_ID=0) → nothing is sent anywhere else
+    c, d = FakeClient(backup_group=-100), FakeDB(src)
+    await worker.TranslationWorker(client=c, db=d, embedded=True).process(dict(job, job_id="j3g4"))
+    assert not c.group and c.topics == 0
+    print("✅ backup group fallbacks ok (no topics · cancel · fail · disabled)")
+
+    # 3h) v6.7 — chunks that exhausted every retry are reported, not silently kept
+    real = translator.TranslationEngine._translate_one
+    async def flaky(self, idx, lines, cancel):
+        self.done += 1
+        if idx == 0:
+            self.failed += 1; return idx, lines
+        return idx, [f"[{self.target}] " + l for l in lines]
+    translator.TranslationEngine._translate_one = flaky
+    try:
+        c, d = FakeClient(backup_group=-100), FakeDB(src)
+        w = worker.TranslationWorker(client=c, db=d, embedded=True); w.backup_group = -100
+        await w.process(dict(job, job_id="j3h"))
+    finally:
+        translator.TranslationEngine._translate_one = real
+    assert d.jobs["j3h"]["status"] == "done" and d.jobs["j3h"]["progress"]["failed_chunks"] == 1
+    assert d.hist[-1]["failed_chunks"] == 1 and "could not be translated" in c.edits[-1] and "untranslated" in c.group[-1][1]
+    print("✅ untranslated chunks reported ok")
 
     # 4) serve()/stop() lifecycle with heartbeat
     c, d = FakeClient(), FakeDB(src)
