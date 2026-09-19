@@ -39,7 +39,7 @@ deliver the result as TXT, DOCX or EPUB — split into parts of any size you lik
 ## ✨ Features
 
 - **Input**: `.epub` `.txt` `.docx` `.pdf` (default limit 50 MB, configurable)
-- **Output**: TXT · DOCX · EPUB, auto-split into parts (presets or custom 50 KB – 15 MB)
+- **Output**: TXT · DOCX · EPUB, auto-split into parts (presets or custom 50 KB – 2000 MB)
   – split size is *output-aware* (Hindi/Bengali etc. take ~2.6× more bytes than English)
 - **25 languages** (Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Urdu, Spanish, French, German, Arabic, Chinese, Japanese …)
 - **Fast async translation engine** – direct HTTP to Google's web endpoint via aiohttp, per-line segments so paragraph structure survives 1:1, exponential-backoff retries + thread fallback

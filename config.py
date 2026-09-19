@@ -114,7 +114,7 @@ REQUEST_TIMEOUT = 40
 DEFAULT_LANG = env("DEFAULT_LANG", "hi")
 DEFAULT_FORMAT = env("DEFAULT_FORMAT", "txt")
 DEFAULT_SPLIT_KB = env_int("DEFAULT_SPLIT_KB", 500)
-MIN_SPLIT_KB, MAX_SPLIT_KB = 50, 15 * 1024
+MIN_SPLIT_KB, MAX_SPLIT_KB = 50, 2000 * 1024   # up to Telegram's 2 GB per-file limit (MTProto)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🌐 WEB SERVER & NETWORKING
