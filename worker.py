@@ -333,6 +333,7 @@ class TranslationWorker:
         parts_sent = 0
         failed_chunks = 0
         text = ""
+        n_chars = 0
         keep_source = False
         topic_id: Optional[int] = None
         user_tag = (f"👤 {html.escape(str(job.get('user_name') or job.get('user_id', '')))} "
@@ -350,6 +351,9 @@ class TranslationWorker:
             # *delivered* parts — not the source slices — must respect the user's split size.
             parts = split_text_by_size(text, int(job.get("split_kb") or 0), split_factor(lang))
             n_parts = len(parts)
+            n_chars = len(text)
+            text = ""                      # free the full-document string (parts hold the data now)
+            source.unlink(missing_ok=True) # source already extracted → free disk early
             stem = safe_filename(Path(safe_filename(name)).stem or name)   # sanitise BEFORE .stem: "My/Novel.epub" → "MyNovel"
 
             if self.backup_group:
@@ -357,7 +361,7 @@ class TranslationWorker:
                 await self._backup_text(
                     f"📥 <b>New Job</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                     f"🌐 {_lang_label(lang)} · 📄 {fmt.upper()} · 💾 {_fmt_size(job.get('size', 0))}\n"
-                    f"{user_tag}\n🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{len(text):,}</b>"
+                    f"{user_tag}\n🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{n_chars:,}</b>"
                     f" · 🖥 <code>{html.escape(self.node_id)}</code>", topic_id)
 
             for part_index, part in enumerate(parts, 1):
@@ -408,21 +412,21 @@ class TranslationWorker:
 
             elapsed = int(time.time() - started)
             await self.db.update_job(job_id, status="done", finished_at=time.time(),
-                                     progress={"phase": "complete", "ratio": 1, "parts": n_parts, "chars": len(text),
+                                     progress={"phase": "complete", "ratio": 1, "parts": n_parts, "chars": n_chars,
                                                "elapsed": elapsed, "failed_chunks": failed_chunks})
             warn = (f"\n⚠️ {failed_chunks} chunk{'s' if failed_chunks != 1 else ''} could not be translated "
                     "and were kept in the original language.") if failed_chunks else ""
             await self._edit(chat_id, msg_id,
                              f"✅ <b>Completed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n"
                              f"🌐 {_lang_label(lang)} · 📄 {fmt.upper()} · 📑 {n_parts} part{'s' if n_parts != 1 else ''}\n"
-                             f"🔤 {len(text):,} characters · ⏱ {_fmt_eta(elapsed)}{warn}")
+                             f"🔤 {n_chars:,} characters · ⏱ {_fmt_eta(elapsed)}{warn}")
             await self._backup_text(
                 f"✅ <b>Job Completed</b>\n{DIV}\n📘 <b>{html.escape(name)}</b>\n{user_tag}\n"
-                f"🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{len(text):,}</b> · ⏱ <b>{_fmt_eta(elapsed)}</b>"
+                f"🧩 Parts: <b>{n_parts}</b> · 🔤 Chars: <b>{n_chars:,}</b> · ⏱ <b>{_fmt_eta(elapsed)}</b>"
                 + (f"\n⚠️ {failed_chunks} untranslated chunk(s)" if failed_chunks else ""), topic_id)
-            await self._finish(job, "done", parts=n_parts, chars=len(text), secs=elapsed, failed_chunks=failed_chunks)
+            await self._finish(job, "done", parts=n_parts, chars=n_chars, secs=elapsed, failed_chunks=failed_chunks)
             self.jobs_done += 1
-            log.info("job %s done (%d parts, %d chars, %ds, %d failed chunks)", job_id, n_parts, len(text), elapsed,
+            log.info("job %s done (%d parts, %d chars, %ds, %d failed chunks)", job_id, n_parts, n_chars, elapsed,
                      failed_chunks)
         except JobCancelled:
             await self.db.update_job(job_id, status="cancelled", finished_at=time.time())
@@ -430,7 +434,7 @@ class TranslationWorker:
                              + (f"\n📤 {parts_sent} part(s) were already delivered." if parts_sent else ""))
             await self._backup_text(f"🛑 Job cancelled: <b>{html.escape(name)}</b> · {user_tag}"
                                     + (f" · {parts_sent} part(s) delivered" if parts_sent else ""), topic_id)
-            await self._finish(job, "cancelled", parts=parts_sent, chars=len(text),
+            await self._finish(job, "cancelled", parts=parts_sent, chars=n_chars,
                                secs=int(time.time() - started))
             log.info("job %s cancelled", job_id)
         except asyncio.CancelledError:
@@ -454,7 +458,7 @@ class TranslationWorker:
                              "Please try again in a few minutes.")
             await self._backup_text(f"⚠️ Job failed: <b>{html.escape(name)}</b> · {user_tag}\n"
                                     f"❗ {html.escape(type(error).__name__)}: {html.escape(str(error)[:160])}", topic_id)
-            await self._finish(job, "failed", parts=parts_sent, chars=len(text),
+            await self._finish(job, "failed", parts=parts_sent, chars=n_chars,
                                secs=int(time.time() - started),
                                error=f"{type(error).__name__}: {error}")
         finally:

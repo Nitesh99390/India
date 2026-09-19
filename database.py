@@ -94,12 +94,22 @@ class MongoDatabase:
         file_id = await self.files.upload_from_stream(filename, io.BytesIO(content), metadata=metadata)
         return str(file_id)
 
+    async def upload_path(self, filename: str, path: str, metadata: Dict[str, Any]) -> Optional[str]:
+        """Stream a file from disk into GridFS in 255 KB chunks — the whole document is
+        never held in RAM (Render free tier has only 512 MB)."""
+        if self.files is None:
+            return None
+        with open(path, "rb") as fh:
+            file_id = await self.files.upload_from_stream(filename, fh, metadata=metadata)
+        return str(file_id)
+
     async def download_to(self, file_id: str, path: str) -> None:
+        """Stream a GridFS file straight to disk (chunk by chunk, no in-RAM copy)."""
         if self.files is None:
             raise RuntimeError("MongoDB GridFS is not connected")
-        target = io.BytesIO()
-        await self.files.download_to_stream(ObjectId(file_id), target)
-        Path(path).write_bytes(target.getvalue())
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            await self.files.download_to_stream(ObjectId(file_id), fh)
 
     async def delete_file(self, file_id: str) -> None:
         if self.files is not None and file_id:

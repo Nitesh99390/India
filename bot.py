@@ -3142,14 +3142,19 @@ async def handle_document(_, m: Message):
         await live.update(header("Downloading", "📥") + f"📘 {b(novel_name)}\n{progress_bar(r)} {r * 100:.0f}%\n"
                           f"{fmt_size(current)} / {fmt_size(total)}")
 
+    tmp_path = os.path.join(INBOX_DIR, f"{job.job_id}{ext}")
     try:
         if not QUEUE_REPO or not QUEUE_REPO.files:
             raise RuntimeError("MongoDB GridFS is required for document uploads")
-        stream = await m.download(in_memory=True, progress=dl_progress)
-        if not stream:
+        # Stream Telegram → disk → GridFS. Never hold the whole document in RAM:
+        # the Render free tier has 512 MB and a 50 MB upload previously needed
+        # 2-3 copies in memory (Pyrogram buffer + bytes + BytesIO) → OOM kill.
+        os.makedirs(INBOX_DIR, exist_ok=True)
+        job.file_path = tmp_path
+        saved = await m.download(file_name=tmp_path, progress=dl_progress)
+        if not saved or not os.path.exists(tmp_path):
             raise RuntimeError("download returned no file")
-        content = stream.getvalue() if hasattr(stream, "getvalue") else bytes(stream)
-        job.gridfs_id = await QUEUE_REPO.upload_bytes(file_name, content, {
+        job.gridfs_id = await QUEUE_REPO.upload_path(file_name, tmp_path, {
             "job_id": job.job_id, "user_id": uid, "content_type": ext,
         }) or ""
         if not job.gridfs_id:
@@ -3158,6 +3163,14 @@ async def handle_document(_, m: Message):
         log.warning("download failed: %s", e)
         job.cleanup()
         return await live.update(header("Download failed", "❌") + "Please send the file again.", back_home_kb(), force=True)
+    finally:
+        # the local copy is only a staging buffer — the worker fetches from GridFS
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        job.file_path = ""
 
     job.msg = status
     PENDING[job.job_id] = job
