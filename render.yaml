@@ -124,3 +124,7 @@ services:
         value: "30"
       - key: WORKER_POLL_INTERVAL
         value: "3"
+      - key: KEEP_ALIVE            # worker pings itself + the master (+ other workers)
+        value: "1"
+      - key: KEEP_ALIVE_INTERVAL
+        value: "600"

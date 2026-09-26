@@ -115,8 +115,13 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 
 > ⚠️ Free-tier notes
 > - The instance is spun down after 15 min without HTTP traffic. The built-in
->   keep-alive pings `RENDER_EXTERNAL_URL/health` every 10 min to prevent that
->   (`KEEP_ALIVE=0` to disable). Free tier also has a monthly hour budget.
+>   **fleet keep-alive** (`keepalive.py`) prevents that: every process — the master
+>   *and* each `worker.py` service — pings `/health` on its own `RENDER_EXTERNAL_URL`
+>   **and** on every other node every 10 min. Nodes discover each other through the
+>   `public_url` they publish with their MongoDB heartbeat (or `KEEP_ALIVE_URLS`),
+>   so the master wakes the workers and the workers wake the master — no external
+>   cron/uptime service needed (`KEEP_ALIVE=0` to disable). Free tier also has a
+>   monthly hour budget.
 > - With `MONGO_URI=off` every deploy/restart wipes memory: approvals, pending requests and the
 >   audit log are lost. Put permanent IDs in `AUTHORIZED_USERS` / `ADMIN_USERS` — or keep MongoDB on.
 > - `OWNER_ID` defaults to the built-in owner; set it explicitly to make someone else the owner.
@@ -150,8 +155,9 @@ All master and worker services must share the same `MONGO_URI`, `MONGO_DB` and `
 | `CONCURRENCY`        | `8`     | Parallel translation requests (1–20)                          |
 | `CHUNK_SIZE`         | `3500`  | Characters per translation request                            |
 | `DEFAULT_LANG` / `DEFAULT_FORMAT` / `DEFAULT_SPLIT_KB` | `hi` / `txt` / `500` | Defaults for new users |
-| `KEEP_ALIVE`         | `1`     | Self-ping to stay awake on Render free tier                   |
+| `KEEP_ALIVE`         | `1`     | Fleet keep-alive: every node pings itself + all others (Render free tier) |
 | `KEEP_ALIVE_INTERVAL`| `600`   | Ping interval in seconds                                      |
+| `KEEP_ALIVE_URLS`    | —       | Optional extra URLs to ping (comma-separated); auto-discovery via MongoDB usually suffices |
 | `PORT`               | `10000` | Set by Render automatically                                   |
 | `EMBEDDED_WORKER`    | `1`     | Master also translates in-process. `0` → polling-only master  |
 | `SERVICE_ROLE`       | `master`| `master` or `worker` (informational; `worker.py` is always a worker) |

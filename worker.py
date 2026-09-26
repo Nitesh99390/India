@@ -35,6 +35,7 @@ from config import (API_HASH, API_ID, BACKUP_GROUP_ID, BOT_TOKEN, CONCURRENCY_LI
                     LANGUAGES, PORT, VERSION, WORKER_HEARTBEAT_INTERVAL, WORKER_NODE_ID, WORKER_POLL_INTERVAL,
                     validate_config)
 from database import MongoDatabase
+from keepalive import SELF_URL, keep_alive_loop
 from translator import (EXTRACTORS, WRITERS, TranslationEngine, build_chunks, close_http, normalise_text,
                         split_text_by_size)
 
@@ -220,7 +221,8 @@ class TranslationWorker:
             try:
                 await self.db.heartbeat(self.node_id, "running" if self.current_job else "idle", self.current_job,
                                         embedded=self.embedded, jobs_done=self.jobs_done,
-                                        jobs_failed=self.jobs_failed, version=VERSION)
+                                        jobs_failed=self.jobs_failed, version=VERSION,
+                                        public_url=SELF_URL)  # lets every other node keep this one awake
                 if self.current_job and not await self.db.touch_job(self.current_job):
                     pass  # cancellation is picked up by the progress callback
             except Exception as e:
@@ -474,6 +476,10 @@ class TranslationWorker:
         tasks = [asyncio.create_task(self.heartbeat_loop(), name=f"{self.node_id}-heartbeat"),
                  asyncio.create_task(self.recover_loop(), name=f"{self.node_id}-recover"),
                  asyncio.create_task(self.queue_loop(), name=f"{self.node_id}-queue")]
+        if not self.embedded:  # the master runs its own keep-alive loop for the embedded worker
+            tasks.append(asyncio.create_task(
+                keep_alive_loop(db=self.db, stop=self.stop_event.is_set, node=self.node_id),
+                name=f"{self.node_id}-keepalive"))
         try:
             await self.stop_event.wait()
         finally:
