@@ -124,6 +124,10 @@ PUBLIC_URL = (env("PUBLIC_URL") or env("RENDER_EXTERNAL_URL")).rstrip("/")
 RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL").rstrip("/")
 KEEP_ALIVE = env_bool("KEEP_ALIVE", True)
 KEEP_ALIVE_INTERVAL = max(60, env_int("KEEP_ALIVE_INTERVAL", 600))
+# Extra public URLs to ping every round (comma-separated), e.g. the other Render
+# services. Usually unnecessary: every master/worker publishes its own URL via its
+# MongoDB heartbeat, so all nodes discover and wake each other automatically.
+KEEP_ALIVE_URLS = [u.strip().rstrip("/") for u in env("KEEP_ALIVE_URLS").split(",") if u.strip()]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🗄 MONGODB & JOB QUEUE

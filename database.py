@@ -287,11 +287,22 @@ class MongoDatabase:
         if self.db is None:
             return []
         cutoff = time.time() - max(WORKER_HEARTBEAT_INTERVAL * 3, 90)
-        rows = await self.db.workers_status.find({"last_seen": {"$gte": cutoff}}, {"_id": 0}).sort("last_seen", DESCENDING).to_list(100)
+        rows = await self.db.workers_status.find({"last_seen": {"$gte": cutoff}, "role": {"$ne": "master"}},
+                                                 {"_id": 0}).sort("last_seen", DESCENDING).to_list(100)
         now = time.time()
         for row in rows:
             row["age"] = int(now - float(row.get("last_seen", now)))
         return rows
+
+    async def keepalive_nodes(self) -> list[dict]:
+        """Every recently-seen node (workers *and* a polling-only master) that
+        published a ``public_url`` — the targets of the cross-service keep-alive."""
+        if self.db is None:
+            return []
+        cutoff = time.time() - max(WORKER_HEARTBEAT_INTERVAL * 3, 90)
+        return await self.db.workers_status.find(
+            {"last_seen": {"$gte": cutoff}, "public_url": {"$nin": ["", None]}},
+            {"_id": 0, "node_id": 1, "public_url": 1}).to_list(100)
 
     async def remove_worker(self, node_id: str) -> None:
         if self.db is not None:

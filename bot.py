@@ -4210,20 +4210,32 @@ async def start_health_server() -> web.AppRunner:
 
 async def keep_alive():
     """Render free tier sleeps after ~15 min without inbound traffic.
-    Pinging our own public URL keeps the instance awake."""
-    if not KEEP_ALIVE or not RENDER_EXTERNAL_URL:
-        log.info("Keep-alive disabled (KEEP_ALIVE=%s, RENDER_EXTERNAL_URL=%r)", KEEP_ALIVE, RENDER_EXTERNAL_URL)
-        return
-    url = f"{RENDER_EXTERNAL_URL}/health"
-    log.info("Keep-alive pinging %s every %ds", url, KEEP_ALIVE_INTERVAL)
-    while not SHUTTING_DOWN:
-        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
-        try:
-            sess = await get_http()
-            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                log.debug("keep-alive → %s", r.status)
-        except Exception as e:
-            log.debug("keep-alive failed: %s", e)
+
+    The master pings its own public URL **and** every worker service that has
+    published a ``public_url`` heartbeat in MongoDB (plus ``KEEP_ALIVE_URLS``),
+    so the whole master + workers fleet stays awake from a single process.
+    Standalone workers run the same loop (see ``keepalive.py``) and ping the
+    master back, so no node depends on any single other node being awake.
+    """
+    from keepalive import keep_alive_loop
+
+    async def publish_master_url():
+        # A polling-only master (EMBEDDED_WORKER=0) has no worker heartbeat, so
+        # advertise its URL separately for the workers' keep-alive loops.
+        if EMBEDDED or not QUEUE_REPO or not RENDER_EXTERNAL_URL:
+            return
+        while not SHUTTING_DOWN:
+            try:
+                await QUEUE_REPO.heartbeat("master", "master", None, embedded=False, version=VERSION,
+                                           public_url=RENDER_EXTERNAL_URL, role="master")
+            except Exception as e:
+                log.debug("master heartbeat failed: %s", e)
+            await asyncio.sleep(max(15, KEEP_ALIVE_INTERVAL // 4))
+
+    await asyncio.gather(
+        keep_alive_loop(db=QUEUE_REPO, stop=lambda: SHUTTING_DOWN, node="master"),
+        publish_master_url(),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
